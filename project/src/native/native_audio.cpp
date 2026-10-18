@@ -155,7 +155,10 @@ class XmaContext {
   void Work() {
     if (!allocated || !enabled) return;
     std::lock_guard g(lock);
-    enabled = false;
+    // Re-check under the lock: a Lock request between the check above and here disabled
+    // the context so the game can rewrite it (new buffers / offsets); decoding it now would
+    // race those edits and store a stale read offset over them.
+    if (!enabled.exchange(false)) return;
     uint8_t* ptr = Memory()->TranslateVirtual(guest);
     XMA_CONTEXT_DATA data(ptr);
     const XMA_CONTEXT_DATA initial = data;
@@ -174,10 +177,20 @@ class XmaContext {
       StoreMerged(data, initial, ptr);
       return;
     }
-    while (free_blocks_ >= minimum) {
+    // Malformed input (every frame failing, e.g. inside a loop region) must neither spin
+    // here holding the lock - the game's Lock request would block its audio thread - nor
+    // play forever: after a long run of failed frames the context goes to the error state.
+    for (int idle = 0; free_blocks_ >= minimum && idle < 16;) {
+      const int32_t free_before = free_blocks_;
+      const uint8_t remaining_before = remaining_subframes_;
       Decode(&data);
       Consume(&data);
       if (!data.IsAnyInputBufferValid() || data.error_status == 4) break;
+      if (failed_frames_ > 512) {
+        data.error_status = 4;
+        break;
+      }
+      idle = (free_blocks_ == free_before && remaining_subframes_ == remaining_before) ? idle + 1 : 0;
     }
     data.output_buffer_write_offset = out_write_ / kOutputBytesPerBlock;
     if (out_write_ == out_read_ && out_used_ == 0) data.output_buffer_valid = 0;
@@ -186,6 +199,7 @@ class XmaContext {
 
   void Clear() {
     std::lock_guard g(lock);
+    enabled = false;
     uint8_t* ptr = Memory()->TranslateVirtual(guest);
     XMA_CONTEXT_DATA data(ptr);
     data.input_buffer_0_valid = 0;
@@ -212,6 +226,7 @@ class XmaContext {
     decoded_.fill(0);
     carry_.fill(0);
     carry_valid_ = false;
+    failed_frames_ = 0;
     pending_limit_ = pending_skip_ = 0;
     remaining_subframes_ = 0;
     loop_limit_ = 0;
@@ -407,6 +422,11 @@ class XmaContext {
       }
       info.current_frame_size = uint32_t(size);
     }
+    if (info.current_frame_size > kMaxFrameSizeInBits) {
+      // Not a frame boundary (corrupt or misaligned data): stop like the decoder's error state.
+      d->error_status = 4;
+      return;
+    }
     BitStream s(input, (packet_index + 1) * kBitsPerPacket);
     s.SetOffset(d->input_buffer_read_offset);
     uint64_t bits = std::min<uint64_t>(s.BitsRemaining(), info.current_frame_size);
@@ -441,6 +461,7 @@ class XmaContext {
       ok = sent >= 0 && received >= 0;
       if (ok) {
         ++g_xma_frames;
+        failed_frames_ = 0;
       } else {
         uint64_t n = ++g_xma_errors;
         if (n <= 12)
@@ -471,6 +492,7 @@ class XmaContext {
       pending_skip_ = start_skip;
     } else {
       carry_valid_ = false;
+      ++failed_frames_;
     }
     if (loop_end_frame) {
       UpdateLoop(d);
@@ -518,6 +540,7 @@ class XmaContext {
   std::array<uint8_t, 1 + 4096> frame_{};
   std::array<uint8_t, kBytesPerFrameChannel * 2> raw_{}, decoded_{}, carry_{};
   bool carry_valid_ = false;
+  uint32_t failed_frames_ = 0;  // consecutive frames the decoder rejected
   uint8_t pending_limit_ = 0, pending_skip_ = 0, remaining_subframes_ = 0, loop_limit_ = 0;
   bool loop_skip_pending_ = false;
   uint8_t* out_base_ = nullptr;

@@ -12,6 +12,7 @@
 //   t0..t31   textures by fetch slot (type chosen by the tfetch dimension)
 //   s0..s31   samplers by fetch slot
 //   t32..     raw vertex buffers, one per used vertex fetch constant (see vfetch_slots)
+//   t96..t127 pixel shader 3D textures as volumes (tex_flags bit 1 selects them over t0..t31)
 
 #pragma once
 
@@ -23,6 +24,8 @@
 namespace street4 {
 
 enum class ShaderStage : uint8_t { kVertex, kPixel };
+
+constexpr uint32_t kVolumeTextureBase = 96;
 
 // Draw-time state that changes the generated code.
 struct ShaderKey {
@@ -53,6 +56,8 @@ struct TranslatedShader {
   uint32_t color_outputs = 0;
   bool writes_depth = false;
   bool uses_kill = false;
+  // Writes memory through eA/eM# (memexport), which is not translated.
+  bool uses_memexport = false;
   // Vertex shader: interpolators written (bits 0-15).
   uint32_t interpolators_written = 0;
 };
@@ -70,7 +75,7 @@ struct alignas(16) SystemConstants {
   uint32_t loops[32];            // loop constants (count, start, step)
   uint32_t vfetch_endian[96];    // endian mode per vertex fetch constant
   uint32_t tex_swizzle[32];      // fetch constant swizzle (3 bits per component)
-  uint32_t tex_flags[32];        // bit0 biased sign, bits 8..15 exp_adjust (signed)
+  uint32_t tex_flags[32];        // bit0 biased sign, bit1 volume, bits 8..15 exp_adjust (signed)
   float tex_size[32][4];         // width, height, depth, 0 (for unnormalized coords)
   float viewport[4];             // xscale, xoffset, yscale, yoffset (applied in VS)
   float viewport_z[4];           // zscale, zoffset, rt_width, rt_height

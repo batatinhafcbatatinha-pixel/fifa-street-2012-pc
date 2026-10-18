@@ -8,11 +8,12 @@ An experimental port of the Xbox 360 FIFA Street (2012, sometimes called "FIFA S
 
 ## Status — work in progress
 
-- Reached on Windows 11 x64 with a build made from this kit: splash screens, videos, title, menus, team selection and a running match (clock, score, HUD and replay prompt update). **The 3D view of the pitch currently renders black** during matches: only the HUD is drawn. This is the main open bug.
+- Reached on Windows 11 x64 with a build made from this kit: splash screens, videos, title, menus, team selection and a running match with the 3D court, players, crowd, lighting, shadows, post-processing and HUD drawn. Colors and lighting have not been compared side by side with the console yet.
+- Render-to-texture results are written back to game memory like the console GPU does, because the game reads some of them with the CPU (it compresses its generated lightmaps and environment maps at load time). This costs a few milliseconds per frame; matches run at roughly 50 fps.
 - Graphics: the Direct3D library inside the game's DLL is hooked and drawn by a native Direct3D 11 renderer; Xenos shader microcode is translated to HLSL SM5; textures are untiled and converted on load. No GPU command processor or emulation plugin.
 - Audio: XMA contexts live in guest memory and are decoded with FFmpeg's XMA decoder; `XAudio` render-driver frames go to XAudio2 with a 5.1 → stereo downmix. No audio hardware model.
 - The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer.
-- Other known issues: occasional very slow frames in some runs and an intermittent audio-heap exhaustion; 47 launcher functions referenced only through data are not yet listed. Expect crashes. DLC is not supported.
+- Other known issues: 47 launcher functions referenced only through data are not yet listed. Expect crashes. DLC is not supported.
 - Windows x64 only.
 
 ## Why a native port instead of an emulator

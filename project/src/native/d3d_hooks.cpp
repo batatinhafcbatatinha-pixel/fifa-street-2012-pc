@@ -109,8 +109,23 @@ REX_EXTERN(__imp__sub_82714060);
 // replay) still own submitted segments (device+0x2B90 > 0): completing early lets the
 // library reuse segment memory the workers are still reading.
 
+// The library's own GPU-less mode (device+0x2B3D bit 0x02, also what its GPU hang recovery
+// 0x827160B0 falls back to; Street 3 uses the same bit at +0x2ABD): timestamps are written by
+// the CPU when inserted (0x82714174), waits return at once (0x826FCC78), kicks skip the ring
+// and segments are no longer handed to the command-buffer worker DPCs (0x82719594). Without
+// it, completion published here could overtake a worker still reading a segment, which then
+// read a recycled segment (null callback at 0x82719174) and left device+0x2B90 stuck.
+void EnableGpulessMode(uint8_t* base, uint32_t dev) {
+  uint8_t* flags = GuestPtr(base, dev + 0x2B3D);
+  if (!(*flags & 0x02)) {
+    *flags |= 0x02;
+    REXLOG_INFO("street4: D3D library GPU-less mode enabled (device {:08X})", dev);
+  }
+}
+
 void PublishCompletion(uint8_t* base, uint32_t dev) {
   g_device = dev;
+  EnableGpulessMode(base, dev);
   uint32_t block = LoadBE32(GuestPtr(base, dev + dev::kStatusBlock));
   if (!block || LoadBE32(GuestPtr(base, dev + 0x2B90)) != 0) return;
   StoreBE32(base, block, LoadBE32(GuestPtr(base, dev + dev::kTimestamp)));
@@ -143,8 +158,10 @@ REX_HOOK_RAW(sub_82714060) {
 }
 
 REX_EXTERN(__imp__sub_82713710);
-// BlockOnFence(device, fence, ...): already complete (see PublishCompletion).
+// BlockOnFence(device, fence, ...): already complete (see PublishCompletion). The CPU reads
+// what the GPU wrote after waiting, so queued resolve results are stored first.
 REX_HOOK_RAW(sub_82713710) {
+  Renderer::Get().FlushWriteBacks(ctx.r4.u32);
   PublishCompletion(base, ctx.r3.u32);
   static std::atomic<int> logged{0};
   if (logged++ < 20) {
@@ -163,6 +180,11 @@ REX_HOOK_RAW(sub_827141A0) {
   ++g_counters.callbacks;
   uint32_t dev = ctx.r3.u32, function = ctx.r6.u32, argument = ctx.r7.u32;
   __imp__sub_827141A0(ctx, base);
+  // 0x82718450 wakes a command-buffer worker to replay the tiled segments that EndTiling
+  // (0x82719430) handed to it. In GPU-less mode EndTiling hands nothing over (draws were
+  // already rendered at full size), so delivering it would replay a stale segment and
+  // drive device+0x2B90 negative.
+  if (function == 0x82718450 && (*GuestPtr(base, dev + 0x2B3D) & 0x02)) return;
   if (function) {
     uint32_t block = LoadBE32(GuestPtr(base, dev + dev::kCallbackBlock));
     if (auto* gfx = NativeGraphicsSystem::Get()) gfx->QueueGpuCallback(block, function, argument);
@@ -307,9 +329,17 @@ REX_HOOK_RAW(sub_82713018) {
     r.src_y1 = int32_t(LoadBE32(GuestPtr(base, rect + 12)));
   }
   r.has_dest = ctx.r6.u32 != 0;
+  if (uint32_t tex = ctx.r6.u32; ValidGuest(tex)) {
+    uint32_t fetch1 = LoadBE32(GuestPtr(base, tex + 0x1C + 4));
+    uint32_t swizzle = (LoadBE32(GuestPtr(base, tex + 0x1C + 12)) >> 1) & 0xFFF;
+    r.dest_format = int32_t(fetch1 & 0x3F);
+    r.dest_endian = int32_t((fetch1 >> 6) & 3);
+    r.dest_red_blue_swap = (swizzle & 7) == 2 && ((swizzle >> 6) & 7) == 0;
+  }
   if (uint32_t point = ctx.r8.u32; ValidGuest(point)) {
     r.dst_x = int32_t(LoadBE32(GuestPtr(base, point)));
     r.dst_y = int32_t(LoadBE32(GuestPtr(base, point + 4)));
+    r.has_dest_point = true;
   }
   __imp__sub_82713018(ctx, base);
   Renderer::Get().Resolve(GuestDevice(base, dev), r);
@@ -363,6 +393,23 @@ REX_HOOK_RAW(sub_82710C68) {
   FlushPending(base);
   uint32_t dev = ctx.r3.u32, color = ctx.r7.u32, stencil = ctx.r9.u32;
   float z = float(ctx.f1.f64);
+  if (Renderer::Get().tracing()) {
+    std::string rects;
+    for (uint32_t i = 0; i < std::min<uint32_t>(ctx.r5.u32, 8) && ValidGuest(ctx.r6.u32); ++i)
+      rects += fmt::format(" ({},{})-({},{})", LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 4)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 8)),
+                           LoadBE32(GuestPtr(base, ctx.r6.u32 + i * 16 + 12)));
+    REXLOG_INFO("trace BeginTiling flags={:X} tiles={}{}", ctx.r4.u32, ctx.r5.u32, rects);
+  }
+  // Union of the tile rectangles ({x0, y0, x1, y1} each).
+  uint32_t tiles = ctx.r5.u32, tile_rects = ctx.r6.u32, extent_w = 0, extent_h = 0;
+  for (uint32_t i = 0; i < std::min<uint32_t>(tiles, 16) && ValidGuest(tile_rects); ++i) {
+    extent_w = std::max(extent_w, LoadBE32(GuestPtr(base, tile_rects + i * 16 + 8)));
+    extent_h = std::max(extent_h, LoadBE32(GuestPtr(base, tile_rects + i * 16 + 12)));
+  }
+  if (extent_w > 8192 || extent_h > 8192) extent_w = extent_h = 0;
+  Renderer::Get().SetTiling(extent_w && extent_h, extent_w, extent_h);
   __imp__sub_82710C68(ctx, base);
   if (!ValidGuest(color)) return;
   float rgba[4];
@@ -371,6 +418,27 @@ REX_HOOK_RAW(sub_82710C68) {
     std::memcpy(&rgba[i], &v, 4);
   }
   Renderer::Get().ClearBound(GuestDevice(base, dev), 1, rgba, true, z, true, uint8_t(stencil));
+}
+
+REX_EXTERN(__imp__sub_82710FD8);
+// EndTiling(device, flags, resolve_rect*, dest_texture*, ...): resolves through 0x82713018.
+REX_HOOK_RAW(sub_82710FD8) {
+  if (Renderer::Get().tracing())
+    REXLOG_INFO("trace EndTiling flags={:X} rect={:08X} dest={:08X}", ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
+  FlushPending(base);
+  __imp__sub_82710FD8(ctx, base);
+  Renderer::Get().SetTiling(false);
+}
+
+REX_EXTERN(__imp__sub_826FD590);
+// Candidate RunCommandBuffer (WAIT_REG_MEM + INDIRECT_BUFFER); diagnostics only.
+REX_HOOK_RAW(sub_826FD590) {
+  static std::atomic<uint64_t> calls{0};
+  uint64_t n = ++calls;
+  if (Renderer::Get().tracing() || n <= 5)
+    REXLOG_INFO("trace 826FD590 #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} lr={:08X}", n, ctx.r3.u32,
+                ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, uint32_t(ctx.lr));
+  __imp__sub_826FD590(ctx, base);
 }
 
 // ----------------------------------------------------------------------------- queries

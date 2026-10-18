@@ -151,6 +151,20 @@ int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t log2_bpb) {
          (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
 }
 
+// 3D tiling (32x16x4 macro tiles; Xenia texture_address.h, BSD).
+int64_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch, uint32_t height,
+                      uint32_t log2_bpb) {
+  pitch = Align(pitch, 32);
+  height = Align(height, 32);
+  int32_t outer = ((((z >> 2) * int32_t(height >> 4) + (y >> 4)) * int32_t(pitch >> 5)) + (x >> 5)) << 7;
+  int32_t inner = ((z & 3) << 5) | (((y >> 1) & 3) << 3) | (x & 7);
+  int64_t bytes = int64_t(outer | inner) << log2_bpb;
+  uint32_t bank = ((y >> 3) ^ (z >> 2)) & 1;
+  uint32_t pipe = ((x >> 3) & 3) ^ (bank << 1);
+  return int64_t((uint32_t(y & 1) << 4) | (pipe << 6) | (bank << 11)) | (bytes & 0xF) |
+         (((bytes >> 4) & 1) << 5) | (((bytes >> 5) & 7) << 8) | (bytes >> 8 << 12);
+}
+
 TextureDesc TextureDescFromFetch(const uint32_t f[6]) {
   TextureDesc d;
   uint32_t sign_x = (f[0] >> 2) & 3, sign_y = (f[0] >> 4) & 3, sign_z = (f[0] >> 6) & 3,
@@ -271,6 +285,8 @@ struct LevelLayout {
   uint32_t row_pitch;      // bytes per block row (linear)
   uint32_t pitch_blocks;   // pitch in blocks (tiled)
   uint32_t slice_stride;   // bytes between array slices
+  uint32_t z_stride = 0;   // bytes between depth slices of a 3D level
+  uint32_t rows = 0;       // block rows, aligned to 32
   uint32_t offset_x = 0, offset_y = 0;  // packed tail offset in blocks
 };
 
@@ -319,6 +335,8 @@ void LevelPitch(const TextureDesc& d, const HostFormatInfo& f, uint32_t level, L
   }
   uint32_t rows = d.dimension == 0 ? 1 : Align(Align(rows_texels, f.block_height) / f.block_height, 32);
   uint32_t stride = l.row_pitch * rows;
+  l.rows = rows;
+  l.z_stride = stride;
   if (d.dimension == 2) stride *= Align(d.depth, 4);
   l.slice_stride = Align(stride, 4096);
 }
@@ -342,6 +360,8 @@ bool LoadTexture(const TextureDesc& d, const std::function<const uint8_t*(uint32
   bool has_base = d.base_address != 0;
   uint32_t first_level = has_base ? 0 : 1;
   uint32_t last_level = std::max(d.mip_max, first_level);
+  // 3D textures: the base level only (its depth slices become the array / volume slices).
+  if (d.dimension == 2) last_level = first_level;
   if (!has_base && !d.mip_address) return false;
   out.width = std::max(d.width >> first_level, 1u);
   out.height = std::max(d.height >> first_level, 1u);
@@ -387,13 +407,19 @@ bool LoadTexture(const TextureDesc& d, const std::function<const uint8_t*(uint32
       sub.row_pitch = host_row;
       sub.slice_pitch = host_row * host_rows;
       sub.data.assign(sub.slice_pitch, 0);
-      uint32_t slice_base = l.address + slice * l.slice_stride;
+      const bool volume = d.dimension == 2;
+      uint32_t slice_base = l.address + slice * (volume ? (d.tiled ? 0 : l.z_stride) : l.slice_stride);
       for (uint32_t by = 0; by < by_count; ++by) {
         for (uint32_t bx = 0; bx < bx_count; ++bx) {
           uint32_t x = bx + l.offset_x, y = by + l.offset_y;
-          uint32_t src = d.tiled ? slice_base + uint32_t(TiledOffset2D(int32_t(x), int32_t(y),
-                                                                       l.pitch_blocks, log2_bpb))
-                                 : slice_base + y * l.row_pitch + x * f.guest_bytes_per_block;
+          uint32_t src;
+          if (!d.tiled)
+            src = slice_base + y * l.row_pitch + x * f.guest_bytes_per_block;
+          else if (volume)
+            src = slice_base + uint32_t(TiledOffset3D(int32_t(x), int32_t(y), int32_t(slice),
+                                                      l.pitch_blocks, l.rows, log2_bpb));
+          else
+            src = slice_base + uint32_t(TiledOffset2D(int32_t(x), int32_t(y), l.pitch_blocks, log2_bpb));
           if ((src & 0x1FFFFFFF) + f.guest_bytes_per_block > 0x20000000u) continue;
           const uint8_t* p = mem + (src & 0x1FFFFFFF);
           SwapCopy(d.endian, block.data(), p, f.guest_bytes_per_block);

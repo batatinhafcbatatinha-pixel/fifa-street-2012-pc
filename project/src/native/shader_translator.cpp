@@ -531,6 +531,7 @@ class Translator {
         dst = Fmt("o_interp[%u]", reg);
         result_.interpolators_written |= 1u << reg;
       } else {
+        if (reg >= 32 && reg <= 37) result_.uses_memexport = true;
         return;  // memory export: unsupported, ignored
       }
     } else {
@@ -541,6 +542,7 @@ class Translator {
         dst = "o_depth4";
         result_.writes_depth = true;
       } else {
+        if (reg >= 32 && reg <= 37) result_.uses_memexport = true;
         return;
       }
     }
@@ -641,7 +643,12 @@ class Translator {
     AluScalarOpcode op = a.scalar_opcode();
     uint32_t swz = a.src_swizzle(3);
     uint32_t ca = ucode::AluInstruction::GetSwizzledComponentIndex(swz, 3);  // W
-    uint32_t cb = ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0);  // X
+    // Single-operand `b` is Z when the vector op also uses source 3, X otherwise.
+    AluVectorOpcode vop = a.vector_opcode();
+    bool vector_uses_src3 = vop == AluVectorOpcode::kMad || vop == AluVectorOpcode::kCndEq ||
+                            vop == AluVectorOpcode::kCndGe || vop == AluVectorOpcode::kCndGt ||
+                            vop == AluVectorOpcode::kDp2Add;
+    uint32_t cb = ucode::AluInstruction::GetSwizzledComponentIndex(swz, vector_uses_src3 ? 2 : 0);
     auto operand = [&]() {
       // Single r#/c# operand in src3.
       uint32_t reg = a.src_reg(3);
@@ -669,8 +676,12 @@ class Translator {
       std::string c = Const(reg, a.src_const_is_addressed(3), a.is_const_address_register_relative());
       std::string t = Temp(a.scalar_const_reg_op_src_temp_reg(), false);
       std::string sa = Fmt("%s.%c", c.c_str(), kComp[ca]);
-      std::string sb = Fmt("%s.%c", t.c_str(), kComp[cb]);
-      if (a.abs_constants()) sa = "abs(" + sa + ")";
+      std::string sb = Fmt("%s.%c", t.c_str(),
+                           kComp[ucode::AluInstruction::GetSwizzledComponentIndex(swz, 0)]);
+      if (a.abs_constants()) {
+        sa = "abs(" + sa + ")";
+        sb = "abs(" + sb + ")";
+      }
       if (a.src_negate(3)) {
         sa = "(-" + sa + ")";
         sb = "(-" + sb + ")";
@@ -976,14 +987,22 @@ class Translator {
           // Stacked 2D textures are bound as arrays: z is the layer index.
           c = Fmt("Tex3DCoord%u(tc)", slot);
         }
-        if (lod_fetch)
-          sample = Fmt("%s.SampleLevel(%s, %s, %s)", tex.c_str(), samp.c_str(), c.c_str(),
+        auto make_sample = [&](const std::string& t, const std::string& coord) {
+          if (lod_fetch)
+            return Fmt("%s.SampleLevel(%s, %s, %s)", t.c_str(), samp.c_str(), coord.c_str(),
                        lod.c_str());
-        else if (bias != 0.0f)
-          sample = Fmt("%s.SampleBias(%s, %s, %s)", tex.c_str(), samp.c_str(), c.c_str(),
+          if (bias != 0.0f)
+            return Fmt("%s.SampleBias(%s, %s, %s)", t.c_str(), samp.c_str(), coord.c_str(),
                        FloatLiteral(bias).c_str());
-        else
-          sample = Fmt("%s.Sample(%s, %s)", tex.c_str(), samp.c_str(), c.c_str());
+          return Fmt("%s.Sample(%s, %s)", t.c_str(), samp.c_str(), coord.c_str());
+        };
+        sample = make_sample(tex, c);
+        if (td == TextureDimension::k3D && stage_ == ShaderStage::kPixel) {
+          // 3D textures are bound as volumes (filtered across slices), stacked ones as arrays;
+          // the fetch constant decides which at draw time (tex_flags bit 1).
+          sample = Fmt("((TexFlags(%uu) & 2u) ? %s : %s)", slot,
+                       make_sample(Fmt("tex%uv", slot), "tc").c_str(), sample.c_str());
+        }
         w.line(Fmt("float4 tf = ApplyTexSwizzle(%s, %uu);", sample.c_str(), slot));
         EmitFetchDest(w, t.dest(), t.is_dest_relative(), t.dest_swizzle(), "tf");
         break;
@@ -1052,10 +1071,13 @@ class Translator {
       }
       s += Fmt("%s tex%u : register(t%u);\nSamplerState samp%u : register(s%u);\n", type, slot,
                slot, slot, slot);
-      if (result_.tfetch_dimension[slot] == TextureDimension::k3D)
+      if (result_.tfetch_dimension[slot] == TextureDimension::k3D) {
         s += Fmt("float3 Tex3DCoord%u(float3 tc) { return float3(tc.xy, floor(tc.z * "
                  "max(sys_tex_size[%u].z, 1.0))); }\n",
                  slot, slot);
+        if (stage_ == ShaderStage::kPixel)
+          s += Fmt("Texture3D<float4> tex%uv : register(t%u);\n", slot, kVolumeTextureBase + slot);
+      }
     }
     for (size_t i = 0; i < result_.vfetch_slots.size(); ++i)
       s += Fmt("ByteAddressBuffer vb%u : register(t%u);\n", uint32_t(i), uint32_t(32 + i));
