@@ -30,6 +30,7 @@ rexglue_setup_target(fifastreet4)
 if(TARGET fifastreet4_fifadllzf_xex)
     target_sources(fifastreet4_fifadllzf_xex PRIVATE
         src/kernel_extra.cpp
+        src/menu_hooks.cpp
         src/native/d3d_hooks.cpp
         src/native/renderer.cpp
         src/native/shader_translator.cpp
@@ -65,4 +66,20 @@ if(TARGET fifastreet4_recomp)
 endif()
 if(TARGET fifastreet4_fifadllzf_xex)
     target_precompile_headers(fifastreet4_fifadllzf_xex PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/street4_dll_dispatch.h")
+endif()
+
+# Vulkan option of the settings menu: DXVK's d3d11.dll/dxgi.dll in vulkan\ next to the
+# executable (pc_settings.cpp loads them by full path when "API grafica" is Vulkan).
+set(DXVK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/dxvk-3.1.1" CACHE PATH
+    "DXVK release for Windows (x64/d3d11.dll, x64/dxgi.dll, LICENSE)")
+if(WIN32 AND EXISTS "${DXVK_DIR}/x64/d3d11.dll")
+    add_custom_command(TARGET fifastreet4 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:fifastreet4>/vulkan"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/x64/d3d11.dll" "${DXVK_DIR}/x64/dxgi.dll"
+                "$<TARGET_FILE_DIR:fifastreet4>/vulkan/")
+    if(EXISTS "${DXVK_DIR}/LICENSE")
+        add_custom_command(TARGET fifastreet4 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DXVK_DIR}/LICENSE"
+                    "$<TARGET_FILE_DIR:fifastreet4>/vulkan/LICENSE.dxvk.txt")
+    endif()
 endif()

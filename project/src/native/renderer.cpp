@@ -504,19 +504,14 @@ bool RendererImpl::EnsureDevice() {
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   if (std::getenv("STREET4_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
-  D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-  // PC settings: graphics card chosen in the settings menu (null = Windows default). This
-  // module keeps its own copy of the settings state.
+  // PC settings: graphics API and card chosen in the settings menu. This module keeps its
+  // own copy of the settings state.
   pcs::Configure(PcGameInfo(), false);
-  IDXGIAdapter1* adapter = pcs::Adapter();
-  HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-                                 nullptr, flags, levels, 2, D3D11_SDK_VERSION, device_.put(), nullptr,
-                                 context_.put());
-  if (adapter) adapter->Release();
+  HRESULT hr = pcs::CreateDevice(flags, device_.put(), context_.put());
   scale_ = pcs::ResolutionScale();
   if (scale_ != 1.0f) REXLOG_INFO("street4 renderer: internal resolution x{:.3f}", scale_);
   if (FAILED(hr)) {
-    REXLOG_ERROR("street4 renderer: D3D11CreateDevice failed ({:08X})", uint32_t(hr));
+    REXLOG_ERROR("street4 renderer: device creation failed ({:08X})", uint32_t(hr));
     device_failed_ = true;
     return false;
   }
