@@ -14,7 +14,7 @@
 #include "native/street4_audio.h"
 #include "script_input.h"
 #include "native/street4_graphics.h"
-#include "pc_options.h"
+#include "pc_game_info.h"
 #include "street4_layout.h"
 
 class Fifastreet4App : public rex::ReXApp {
@@ -51,9 +51,8 @@ class Fifastreet4App : public rex::ReXApp {
 
   // Native graphics only: no GPU plugin, no Xenos command processor.
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    std::string failed;
-    if (!street4::pc::ApplyOptionsToRuntime(failed))
-      REXLOG_WARN("street4: PC options not applied: {}", failed);
+    // In-game PC settings (F1): window size/mode and game language from fifastreet4-pc.ini.
+    pcs::Configure(PcGameInfo());
     config.gpu_plugin.clear();
     config.graphics = std::make_unique<street4::NativeGraphicsSystem>();
     // Native audio only: no APU / XMA register emulation.

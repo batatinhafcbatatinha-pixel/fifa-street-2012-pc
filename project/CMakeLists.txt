@@ -13,8 +13,7 @@ include(generated/rexglue.cmake)
 # Launcher: native graphics system (no GPU plugin) and PC options.
 set(FIFASTREET4_SOURCES
     src/main.cpp
-    src/pc_options.cpp
-    src/pc_options_runtime.cpp
+    src/pc_settings.cpp
 )
 
 if(WIN32)
@@ -37,6 +36,7 @@ if(TARGET fifastreet4_fifadllzf_xex)
         src/native/texture_loader.cpp
         src/native/native_audio.cpp
         src/native/game_log.cpp
+        src/pc_settings.cpp
     )
     target_include_directories(fifastreet4_fifadllzf_xex PRIVATE src src/native)
     # XMA decoding with the SDK's prebuilt libavcodec (Xenia FFmpeg fork); headers from
@@ -50,11 +50,6 @@ if(TARGET fifastreet4_fifadllzf_xex)
     endif()
 endif()
 
-# Standalone native options window (never starts the game).
-if(WIN32)
-    add_executable(fifastreet4_options WIN32 src/pc_menu.cpp src/pc_options.cpp)
-    target_include_directories(fifastreet4_options PRIVATE src)
-endif()
 
 # Offline shader translator check (tool; never runs the game).
 if(WIN32)

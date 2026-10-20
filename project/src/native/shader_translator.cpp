@@ -45,7 +45,7 @@ cbuffer SystemConstants : register(b2) {
   float sys_window_offset_y;
   uint sys_alpha_test;
   float sys_alpha_ref;
-  float2 sys_pad0;
+  float2 sys_res_scale;
   float4 sys_rt_exp_scale;
 };
 
@@ -1132,7 +1132,8 @@ class Translator {
       s += "  [unroll] for (uint ii = 0; ii < 16u; ++ii) r[ii] = input.interp[ii];\n";
       if (key_.param_gen && key_.param_gen_register < temps) {
         // XY = pixel position, Z = front facing sign, W = point coordinate (0).
-        s += Fmt("  r[%u] = float4(input.position.xy - 0.5, input.front ? 0.0 : -0.0, 0.0);\n",
+        // In guest pixels: the render target may be drawn at a higher internal resolution.
+        s += Fmt("  r[%u] = float4(input.position.xy * sys_res_scale.y - 0.5, input.front ? 0.0 : -0.0, 0.0);\n",
                  key_.param_gen_register);
         s += Fmt("  if (!input.front) r[%u].x = -r[%u].x - 1.0;\n", key_.param_gen_register,
                  key_.param_gen_register);

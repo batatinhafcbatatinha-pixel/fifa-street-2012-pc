@@ -84,7 +84,7 @@ struct alignas(16) SystemConstants {
   float window_offset_x, window_offset_y;
   uint32_t alpha_test;           // bit 3 enable, bits 0-2 function
   float alpha_ref;
-  float color_exp_scale[2];      // unused padding pair kept for alignment
+  float res_scale[2];            // internal resolution: host pixels per guest pixel, inverse
   float rt_exp_scale[4];         // 2^color_exp_bias for each render target
 };
 

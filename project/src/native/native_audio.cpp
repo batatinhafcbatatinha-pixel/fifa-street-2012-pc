@@ -36,6 +36,7 @@ extern "C" {
 #include <rex/audio/xma/helpers.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include "pc_settings.h"
 #include <rex/runtime.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
@@ -726,12 +727,6 @@ class RenderDriver {
     f.nAvgBytesPerSec = 48000 * 8;
     if (FAILED(xaudio_->CreateSourceVoice(&voice_, &f))) return false;
     voice_->Start(0);
-    // PC option "Mute" (fifastreet4-pc.ini next to the executable).
-    wchar_t path[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring ini(path, n);
-    ini = ini.substr(0, ini.find_last_of(std::wstring{wchar_t(92), L'/'}) + 1) + L"fifastreet4-pc.ini";
-    if (GetPrivateProfileIntW(L"PC", L"Mute", 0, ini.c_str())) master_->SetVolume(0.0f);
     return true;
   }
 
@@ -778,6 +773,9 @@ class RenderDriver {
       // Keep ~3 frames (16 ms) queued in XAudio2; without output, pace by the clock.
       uint32_t queued = 0;
       if (audio) {
+        // PC settings volume (0 while the settings menu holds the game).
+        float volume = pcs::Volume();
+        if (volume != volume_) master_->SetVolume(volume_ = volume);
         XAUDIO2_VOICE_STATE st;
         voice_->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
         queued = st.BuffersQueued;
@@ -833,6 +831,7 @@ class RenderDriver {
   rex::system::object_ref<rex::system::XHostThread> thread_;
   IXAudio2* xaudio_ = nullptr;
   IXAudio2MasteringVoice* master_ = nullptr;
+  float volume_ = 1.0f;
   IXAudio2SourceVoice* voice_ = nullptr;
 };
 

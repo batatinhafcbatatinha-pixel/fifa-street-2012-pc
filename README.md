@@ -4,16 +4,19 @@
 > This repository does **not** include the game, an ISO/XEX, EA assets, generated game code or a precompiled executable.
 > You need your own Xbox 360 disc (USA/Europe). See [the full notice](#notice) at the end.
 
+> [!TIP]
+> **New: play without a controller.** The keyboard now plays as an Xbox controller, with the basic actions of **EA SPORTS FC 27's default WASD layout**: WASD to move, **L** pass, **;** shoot, **K** cross, **O** through ball, **P** sprint, **Esc** pause. See [Keyboard controls](#keyboard-controls).
+
 An experimental port of the Xbox 360 FIFA Street (2012, sometimes called "FIFA Street 4"), built through static recompilation with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk), with its own Direct3D 11 renderer and its own XMA audio pipeline. **This public repository is a source and local-build kit, not a ready-to-play game download.** The game's PowerPC code (the launcher `default.xex` and the main game library `fifadllzf.xex.dll`) is translated locally from your own verified disc; no game executable or generated game code is distributed here.
 
 ## Status — work in progress
 
-- Reached on Windows 11 x64 with a build made from this kit: splash screens, videos, title, menus, team selection and a running match with the 3D court, players, crowd, lighting, shadows, post-processing and HUD drawn. Colors and lighting have not been compared side by side with the console yet.
-- Render-to-texture results are written back to game memory like the console GPU does, because the game reads some of them with the CPU (it compresses its generated lightmaps and environment maps at load time). This costs a few milliseconds per frame; matches run at roughly 50 fps.
+- Reached on Windows 11 x64 with a build made from this kit: splash screens, videos, title, menus, team selection and a running match with the 3D court, players, crowd, lighting, shadows, post-processing and HUD drawn. Team kits and crowd colors match the game's textures; a side-by-side comparison with the console has not been made yet.
+- Render-to-texture results are written back to game memory like the console GPU does, because the game reads some of them with the CPU (it compresses its generated lightmaps and environment maps at load time). Per-frame post-processing targets are written back only once per second, so this costs well under a millisecond per frame; matches run at 60 fps. Lightmaps the game bakes over many frames at load time reach memory as soon as the CPU waits for them (earlier builds compressed stale data, which drew the crowd, the stands and the ground around the court red).
 - Graphics: the Direct3D library inside the game's DLL is hooked and drawn by a native Direct3D 11 renderer; Xenos shader microcode is translated to HLSL SM5; textures are untiled and converted on load. No GPU command processor or emulation plugin.
 - Audio: XMA contexts live in guest memory and are decoded with FFmpeg's XMA decoder; `XAudio` render-driver frames go to XAudio2 with a 5.1 → stereo downmix. No audio hardware model.
 - The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer.
-- Other known issues: 47 launcher functions referenced only through data are not yet listed. Expect crashes. DLC is not supported.
+- Other known issues: crashes may remain. DLC is not supported.
 - Windows x64 only.
 
 ## Why a native port instead of an emulator
@@ -52,11 +55,31 @@ python tools/build_local.py --game-files game_files --llvm-dir "C:\Program Files
 python tools/play.py --game-files game_files
 ```
 
-`build_local.py` validates your files, downloads the pinned ReXGlue SDK nightly (`0.10.0.24-dev.gbd833a2`, SHA-256 checked) and applies the FPSCR patch in `patches/`, downloads the FFmpeg headers matching the SDK's `libavcodec`, translates both modules into private C++ under `.local/`, compiles the port and the `fifastreet4_options` settings tool, and removes any GPU emulation plugin from the output. The translation of the 29 MB game library is large: expect a long first build and several GB of disk space in `.local/`.
+`build_local.py` validates your files, downloads the pinned ReXGlue SDK nightly (`0.10.0.24-dev.gbd833a2`, SHA-256 checked) and applies the FPSCR patch in `patches/`, downloads the FFmpeg headers matching the SDK's `libavcodec`, translates both modules into private C++ under `.local/`, compiles the port and removes any GPU emulation plugin from the output. The translation of the 29 MB game library is large: expect a long first build and several GB of disk space in `.local/`.
+
+## Keyboard controls
+
+No controller needed: the keyboard plays as an Xbox controller, with the keys of the default **WASD** layout of EA SPORTS FC 27 ([EA's layout chart](https://help.ea.com/en/articles/ea-sports-fc/mouse-keyboard/)). Only the basic actions are mapped for now.
+
+| Key | In a match | In menus | Controller button |
+| --- | --- | --- | --- |
+| **W A S D** (or arrows) | Move the player | Navigate | Left stick |
+| **L** | Ground pass · press (defending) | Confirm | A |
+| **;** (**Ç** on ABNT2 keyboards) | Shoot · tackle (defending) | Back | B |
+| **K** | Lob pass / cross · sliding tackle | | X |
+| **O** | Through pass · goalkeeper rush | | Y |
+| **P** | Sprint | | RT |
+| **I** | Change player | | LB |
+| **Enter** | | Confirm, passes *PRESS START* | A + Start |
+| **Esc** | Pause | | Start |
+| **Backspace** | | Back | B |
+| **Tab** | | | Back |
+
+The keyboard and an Xbox controller work at the same time. Skill moves, modifier keys (finesse, chip, power shots) and the mouse are not mapped yet. To turn the keyboard off, add `teclado=0` to the `[opcoes]` section of `fifastreet4-pc.ini` next to the executable.
 
 ## Settings
 
-`fifastreet4_options.exe` (built next to the game in `.local/build/`) sets window size, borderless fullscreen, VSync and mute before you start the game. Xbox controllers work as on the console.
+**F1** opens the PC settings over the game (display mode, internal resolution, VSync, frame limit, FXAA, anisotropic filtering, game language, volume); **Alt + Enter** or **F11** toggles fullscreen. Settings are saved in `fifastreet4-pc.ini` next to the executable. Xbox controllers work as on the console.
 
 ## Credits and licenses
 

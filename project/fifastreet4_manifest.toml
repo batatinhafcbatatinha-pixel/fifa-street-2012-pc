@@ -10,6 +10,44 @@ file_path = "@GAME_FILES@/default.xex"
 out_directory_path = "generated/default"
 includes = []
 
+[entrypoint.functions]
+# Launcher entry points referenced only through data (vtable this-adjust thunks, short methods);
+# scripts/find_missing_functions_exe.py, bounds follow PPC control flow. SEH scope labels inside
+# .pdata functions are excluded (they are not entries).
+0x82055188 = { end = 0x82055190 }
+0x82092408 = { end = 0x82092428 }
+0x82094680 = { end = 0x82094694 }
+0x820AA428 = { end = 0x820AA478 }
+0x8211DF98 = { end = 0x8211DFA0 }
+0x82120240 = { end = 0x82120248 }
+0x82120248 = { end = 0x82120250 }
+0x82120250 = { end = 0x82120258 }
+0x82120258 = { end = 0x82120260 }
+0x82120268 = { end = 0x82120270 }
+0x82120270 = { end = 0x82120278 }
+0x82120278 = { end = 0x82120280 }
+0x82120280 = { end = 0x821202D8 }
+0x821202D8 = { end = 0x821202E0 }
+0x82125380 = { end = 0x82125388 }
+0x82125390 = { end = 0x82125398 }
+0x82125398 = { end = 0x821253A0 }
+0x821253A0 = { end = 0x821253A8 }
+0x821253A8 = { end = 0x8212549C }
+0x82126740 = { end = 0x82126748 }
+0x82126750 = { end = 0x82126758 }
+0x82126758 = { end = 0x82126760 }
+0x82126760 = { end = 0x82126768 }
+0x82126768 = { end = 0x82126770 }
+0x82126770 = { end = 0x8212686C }
+0x82126EC8 = { end = 0x82126EE0 }
+0x82127C40 = { end = 0x82127C48 }
+0x82128998 = { end = 0x821289A0 }
+0x8212B7A8 = { end = 0x8212B7D4 }
+0x8212BA38 = { end = 0x8212BA40 }
+0x82139EB8 = { end = 0x82139EC0 }
+0x82139EC0 = { end = 0x82139EC8 }
+0x8213B640 = { end = 0x8213B648 }
+
 [[modules]]
 guest_path = "fifadllzf.xex.dll"
 file_path = "@GAME_FILES@/fifadllzf.xex.dll"

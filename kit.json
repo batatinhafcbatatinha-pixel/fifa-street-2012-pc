@@ -12,9 +12,7 @@
   "project_dir": "project",
   "manifest": "fifastreet4_manifest.toml",
   "target": "fifastreet4",
-  "extra_targets": [
-    "fifastreet4_options"
-  ],
+  "extra_targets": [],
   "copy": [
     "project"
   ],

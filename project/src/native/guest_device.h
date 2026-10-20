@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include <rex/memory.h>
 
@@ -123,7 +124,22 @@ class GuestDevice {
 struct ShaderMicrocode {
   uint32_t address = 0;  // guest virtual address
   uint32_t dword_count = 0;
+  const uint8_t* host = nullptr;  // when set, the microcode is here instead (big-endian too)
 };
+
+// The flush patches a binding's vfetch instructions in place (0x8271AEF8) only when the GPU
+// is past the binding's last use; otherwise (0x8271ACF0) it copies the microcode into the
+// command buffer (IM_LOAD_IMMEDIATE), patches the copy and leaves memory patched for the
+// previous vertex declaration. The copy stays the loaded shader until the next load; the
+// hooks keep it here (d3d_hooks.cpp) and VertexShaderMicrocode returns it.
+struct ImmediateVertexShader {
+  uint32_t shader = 0, binding = 0;
+  std::vector<uint8_t> code;
+};
+inline ImmediateVertexShader& LoadedImmediateVertexShader() {
+  static ImmediateVertexShader s;
+  return s;
+}
 
 // D3DVertexShader: microcode base at +0x20 (physical), binding table at +0x380 (8 bytes
 // per binding; first word = offset of the binding record relative to the shader).
@@ -139,6 +155,9 @@ inline ShaderMicrocode VertexShaderMicrocode(uint8_t* membase, uint32_t shader) 
   if (!ValidGuest(record) || !ValidGuest(LoadBE32(s + 0x20))) return m;
   m.address = LoadBE32(s + 0x20) + LoadBE32(GuestPtr(membase, record + 0x368));
   m.dword_count = LoadBE32(GuestPtr(membase, record + 0x36C)) / 4;
+  const auto& imm = LoadedImmediateVertexShader();
+  if (imm.shader == shader && imm.binding == binding && imm.code.size() == size_t(m.dword_count) * 4)
+    m.host = imm.code.data();
   return m;
 }
 

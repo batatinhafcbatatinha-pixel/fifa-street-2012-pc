@@ -208,6 +208,45 @@ REX_HOOK_RAW(sub_82713368) {
   if (auto* gfx = NativeGraphicsSystem::Get()) gfx->ReportReadPointer(write_index);
 }
 
+// ----------------------------------------------------------------------------- shaders
+REX_EXTERN(__imp__sub_8271AEF8);
+// PatchVertexShaderInPlace(device, shader, declaration, binding) -> 0 when the GPU may still
+// read the binding (see ImmediateVertexShader in guest_device.h); else the binding in memory
+// is the loaded shader again.
+REX_HOOK_RAW(sub_8271AEF8) {
+  uint32_t shader = ctx.r4.u32, binding = ctx.r6.u32;
+  __imp__sub_8271AEF8(ctx, base);
+  auto& imm = LoadedImmediateVertexShader();
+  if (ctx.r3.u32 && imm.shader == shader && imm.binding == binding) imm = {};
+}
+
+REX_EXTERN(__imp__sub_8271ACF0);
+// LoadVertexShaderImmediate(device, patch, shader, ..., binding [r10]): copies the binding's
+// microcode behind an IM_LOAD_IMMEDIATE header into the command buffer and patches the copy;
+// the copy ends at the command buffer pointer (device+48) on return.
+REX_HOOK_RAW(sub_8271ACF0) {
+  uint32_t dev = ctx.r3.u32, shader = ctx.r5.u32, binding = ctx.r10.u32;
+  uint32_t before = LoadBE32(GuestPtr(base, dev + 48));
+  __imp__sub_8271ACF0(ctx, base);
+  uint32_t end = LoadBE32(GuestPtr(base, dev + 48));
+  static const bool disabled = std::getenv("STREET4_NO_IMMEDIATE_VS") != nullptr;  // diagnostics
+  if (disabled || end == before || binding > 1 || !ValidGuest(shader)) return;
+  uint32_t record = shader + LoadBE32(GuestPtr(base, shader + 0x380 + 8 * binding));
+  if (!ValidGuest(record)) return;
+  uint32_t size = LoadBE32(GuestPtr(base, record + 0x36C));
+  uint32_t start = end - size + 4;
+  if (!size || size > 0x10000 || (size & 3) || !ValidGuest(start)) return;
+  auto& imm = LoadedImmediateVertexShader();
+  imm.shader = shader;
+  imm.binding = binding;
+  const uint8_t* src = GuestPtr(base, start);
+  imm.code.assign(src, src + size);
+  static std::atomic<int> logs{0};
+  if (logs.fetch_add(1) < 8)
+    REXLOG_INFO("street4: vertex shader {:08X} binding {} loaded through the command buffer ({} bytes at {:08X})",
+                shader, binding, size, start);
+}
+
 // ----------------------------------------------------------------------------- draws
 REX_EXTERN(__imp__sub_8271C8C8);
 // DrawIndexedVertices(device, primitive, base_vertex, start_index, index_count).

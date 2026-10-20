@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -33,6 +34,7 @@
 #include <rex/ui/window.h>
 
 #include "renderer.h"
+#include "pc_game_info.h"
 #include "shader_translator.h"
 #include "texture_loader.h"
 
@@ -124,6 +126,13 @@ bool TraceFrame(uint64_t frame) {
   auto& w = Trace();
   if (w.timed && w.first == ~0ull && std::chrono::steady_clock::now() >= w.deadline) w.first = frame + 1;
   return frame >= w.first && frame < w.first + w.count;
+}
+// Diagnostics: STREET4_TRACE_SURFACE=<w>x<h> traces every draw, clear and resolve whose window
+// (scissor extent) has that size, in any frame (passes whose frame number varies between runs,
+// like load-time generated maps).
+bool TraceSurface(uint32_t width, uint32_t height) {
+  static const char* ts = std::getenv("STREET4_TRACE_SURFACE");
+  return ts && *ts && fmt::format("{}x{}", width, height) == ts;
 }
 
 float AsFloat(uint32_t v) {
@@ -279,10 +288,13 @@ struct ShaderEntry {
   bool failed = false;
 };
 
+// Sizes are in guest pixels; the host texture is `scale` times larger (internal resolution, see
+// RendererImpl::ScaleFor).
 struct RenderTarget {
   uint32_t edram_base = 0, format = 0, pitch = 0;
   bool depth = false;
   uint32_t width = 0, height = 0;
+  float scale = 1.0f;
   Com<ID3D11Texture2D> texture;
   Com<ID3D11RenderTargetView> rtv;
   Com<ID3D11DepthStencilView> dsv;
@@ -305,6 +317,7 @@ struct HostTexture {
 
 struct ResolvedTexture {
   uint32_t address = 0, width = 0, height = 0, format = 0;
+  float scale = 1.0f;  // host texels per guest texel (internal resolution)
   Com<ID3D11Texture2D> texture;
   Com<ID3D11RenderTargetView> rtv;
   Com<ID3D11ShaderResourceView> srv;
@@ -335,11 +348,14 @@ class RendererImpl {
   uint64_t frame() const { return frame_; }
   // Diagnostics: writes a texture (8-bit RGBA or 16-bit float formats) as a 24-bit BMP.
   void DumpTexture(ID3D11Texture2D* texture, const std::string& path);
+  uint32_t ReadPixel(ID3D11Texture2D* texture, uint32_t x, uint32_t y);
   void QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, uint32_t dest_pitch,
                       uint32_t endian, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t fence);
   // Stores queued resolve results in guest memory: those issued before `fence` (`all`, when the
   // CPU waits for that fence), or those of earlier frames (at present, when the GPU is done).
   void DrainWriteBacks(bool all, uint32_t fence = 0);
+  ID3D11Texture2D* GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y, int32_t w,
+                                 int32_t h);
   void SetTiling(bool active, uint32_t width, uint32_t height) {
     if (active) Trace().OnTiling(frame_);
     if (active) ++frame_tilings_;
@@ -357,8 +373,8 @@ class RendererImpl {
   ShaderEntry* GetShader(ShaderStage stage, const ShaderMicrocode& code, const ShaderKey& key);
   bool Compile(const std::string& source, const char* entry, const char* target,
                std::vector<uint8_t>& out, const std::string& cache_name);
-  RenderTarget* GetRenderTarget(bool depth, uint32_t base, uint32_t format, uint32_t pitch,
-                                uint32_t height);
+  RenderTarget* GetRenderTarget(const GuestDevice& dev, bool depth, uint32_t base, uint32_t format,
+                                uint32_t pitch, uint32_t height);
   ID3D11ShaderResourceView* GetTexture(const uint32_t fetch[6], TextureDimension dim,
                                        float size_out[4],
                                        ID3D11ShaderResourceView** volume_out = nullptr);
@@ -375,7 +391,19 @@ class RendererImpl {
                                uint32_t format, bool create);
   void BlitTo(ID3D11RenderTargetView* rtv, uint32_t dst_w, uint32_t dst_h, D3D11_VIEWPORT vp,
               ID3D11ShaderResourceView* src, float src_w, float src_h, float u0, float v0,
-              float u1, float v1, bool depth, bool swap_rb = false);
+              float u1, float v1, bool depth, bool swap_rb = false, bool point = false);
+  // Internal resolution. Render passes and resolve destinations at least 640 wide (the scene,
+  // half-resolution post-processing, shadow maps) are drawn scale_ times larger; smaller ones
+  // (light probes, reduction chains, lightmaps the CPU compresses) keep the guest size: scaling
+  // them gains nothing and changes values the game reads back (crowd lighting, exposure).
+  float ScaleFor(uint32_t width) const { return width >= 640 ? scale_ : 1.0f; }
+  static uint32_t ScaledSize(uint32_t v, float s) {
+    return std::max<uint32_t>(1, uint32_t(std::ceil(float(v) * s - 0.001f)));
+  }
+  static LONG ScaledCoord(LONG v, float s) { return LONG(std::lround(float(v) * s)); }
+  static D3D11_RECT ScaledRect(LONG x0, LONG y0, LONG x1, LONG y1, float s) {
+    return {ScaledCoord(x0, s), ScaledCoord(y0, s), ScaledCoord(x1, s), ScaledCoord(y1, s)};
+  }
 
   // Device.
   Com<ID3D11Device> device_;
@@ -391,6 +419,9 @@ class RendererImpl {
   uint8_t* membase_ = nullptr;
   uint8_t* physbase_ = nullptr;
   uint64_t frame_ = 0;
+  float scale_ = 1.0f;  // internal resolution (pcs::ResolutionScale), fixed at boot
+  // Guest-size copies of scaled resolve results on their way to guest memory, by destination.
+  std::unordered_map<uint32_t, std::pair<Com<ID3D11Texture2D>, Com<ID3D11RenderTargetView>>> writeback_scratch_;
   std::chrono::steady_clock::time_point next_present_{};
   uint32_t frame_draws_ = 0, frame_tiled_draws_ = 0, frame_tilings_ = 0;
   bool tiling_ = false;
@@ -408,10 +439,31 @@ class RendererImpl {
     int32_t x, y, w, h;
     uint64_t frame;
     uint32_t fence;  // last timestamp the D3D library issued before the resolve
+    bool steady;     // destination resolved every frame (see QueueWriteBack)
+    bool throttled;  // steady result between the once-a-second copies: stored only for a fence wait
+    bool pack4444;   // 4_4_4_4 destination kept as RGBA8 on the host
+    uint64_t snapshot;  // guest memory there when queued (MemorySnapshot); changed = CPU reused it
+  };
+  // Strided hash of the guest memory a write-back covers.
+  uint64_t MemorySnapshot(uint32_t dest_base, uint32_t dest_pitch, uint32_t bpp, int32_t y, int32_t h) {
+    uint32_t extent = ((dest_pitch + 31) & ~31u) * ((uint32_t(y + h) + 31) & ~31u) * bpp;
+    uint32_t base = dest_base & 0x1FFFFFFF;
+    extent = std::min(extent, 0x20000000u - base);
+    if (extent <= 64 * 256) return Hash64(Physical(base), extent);
+    uint64_t hash = 0;
+    for (uint32_t i = 0; i < 64; ++i)
+      hash = Hash64(Physical(base + uint32_t(uint64_t(extent - 256) * i / 63)), 256, hash);
+    return hash;
+  }
+  struct WriteBackHistory {
+    uint64_t last_frame = ~0ull;   // last frame a resolve went to this destination
+    uint64_t queued_frame = ~0ull; // last frame a copy was queued
+    uint32_t streak = 0;           // frames with a resolve there, at most 3 frames apart
   };
   std::deque<PendingWriteBack> writebacks_;
   std::unordered_map<uint32_t, uint32_t> writebacks_by_address_;
   std::unordered_map<uint32_t, uint64_t> writeback_last_stored_;  // address -> frame
+  std::unordered_map<uint32_t, WriteBackHistory> writeback_history_;
   std::vector<Com<ID3D11Texture2D>> staging_pool_;
   std::unordered_map<uint64_t, std::unique_ptr<VertexBufferEntry>> vertex_buffers_;
   std::vector<std::unique_ptr<VertexBufferEntry>> transient_vbs_;
@@ -453,8 +505,16 @@ bool RendererImpl::EnsureDevice() {
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   if (std::getenv("STREET4_D3D_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
   D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-  HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2,
-                                 D3D11_SDK_VERSION, device_.put(), nullptr, context_.put());
+  // PC settings: graphics card chosen in the settings menu (null = Windows default). This
+  // module keeps its own copy of the settings state.
+  pcs::Configure(PcGameInfo(), false);
+  IDXGIAdapter1* adapter = pcs::Adapter();
+  HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                 nullptr, flags, levels, 2, D3D11_SDK_VERSION, device_.put(), nullptr,
+                                 context_.put());
+  if (adapter) adapter->Release();
+  scale_ = pcs::ResolutionScale();
+  if (scale_ != 1.0f) REXLOG_INFO("street4 renderer: internal resolution x{:.3f}", scale_);
   if (FAILED(hr)) {
     REXLOG_ERROR("street4 renderer: D3D11CreateDevice failed ({:08X})", uint32_t(hr));
     device_failed_ = true;
@@ -489,13 +549,18 @@ bool RendererImpl::EnsureDevice() {
   make_cb(cb_blit_, 32);
 
   std::vector<uint8_t> code;
-  if (Compile(kRectListGs, "main", "gs_5_0", code, "rect_list_gs"))
+  // Cached by source hash too: a stale blit_ps without the red/blue swap swapped every
+  // 8_8_8_8 resolve's colors.
+  auto internal = [](const char* source, const char* name) {
+    return fmt::format("{}_{:08x}", name, static_cast<uint32_t>(Hash64(source, std::strlen(source))));
+  };
+  if (Compile(kRectListGs, "main", "gs_5_0", code, internal(kRectListGs, "rect_list_gs")))
     device_->CreateGeometryShader(code.data(), code.size(), nullptr, rect_gs_.put());
-  if (Compile(kBlitHlsl, "vs_main", "vs_5_0", code, "blit_vs"))
+  if (Compile(kBlitHlsl, "vs_main", "vs_5_0", code, internal(kBlitHlsl, "blit_vs")))
     device_->CreateVertexShader(code.data(), code.size(), nullptr, blit_vs_.put());
-  if (Compile(kBlitHlsl, "ps_main", "ps_5_0", code, "blit_ps"))
+  if (Compile(kBlitHlsl, "ps_main", "ps_5_0", code, internal(kBlitHlsl, "blit_ps")))
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_ps_.put());
-  if (Compile(kBlitHlsl, "ps_depth", "ps_5_0", code, "blit_depth_ps"))
+  if (Compile(kBlitHlsl, "ps_depth", "ps_5_0", code, internal(kBlitHlsl, "blit_depth_ps")))
     device_->CreatePixelShader(code.data(), code.size(), nullptr, blit_depth_ps_.put());
 
   D3D11_SAMPLER_DESC sd{};
@@ -537,6 +602,7 @@ bool RendererImpl::EnsureSwapChain() {
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     d.BufferCount = 2;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    d.Flags = pcs::SwapChainFlags();
     if (FAILED(factory->CreateSwapChainForHwnd(device_.get(), hwnd_, &d, nullptr, nullptr,
                                                swap_chain_.put()))) {
       REXLOG_ERROR("street4 renderer: swap chain creation failed");
@@ -546,7 +612,7 @@ bool RendererImpl::EnsureSwapChain() {
   } else {
     backbuffer_rtv_.reset();
     context_->OMSetRenderTargets(0, nullptr, nullptr);
-    swap_chain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    swap_chain_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, pcs::SwapChainFlags());
   }
   Com<ID3D11Texture2D> bb;
   swap_chain_->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(bb.put()));
@@ -593,8 +659,8 @@ bool RendererImpl::Compile(const std::string& source, const char* entry, const c
 
 ShaderEntry* RendererImpl::GetShader(ShaderStage stage, const ShaderMicrocode& code,
                                      const ShaderKey& key) {
-  if (!code.address || !code.dword_count || code.dword_count > 0x10000) return nullptr;
-  const uint8_t* src = Virtual(code.address);
+  if ((!code.address && !code.host) || !code.dword_count || code.dword_count > 0x10000) return nullptr;
+  const uint8_t* src = code.host ? code.host : Virtual(code.address);
   uint64_t hash = Hash64(src, code.dword_count * 4, uint64_t(stage) + 1) ^ (key.Pack() * 0x9E37ull);
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) return it->second->failed ? nullptr : it->second.get();
@@ -644,12 +710,18 @@ ShaderEntry* RendererImpl::GetShader(ShaderStage stage, const ShaderMicrocode& c
 }
 
 // --------------------------------------------------------------------------- targets
-RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t format,
-                                            uint32_t pitch, uint32_t height) {
+RenderTarget* RendererImpl::GetRenderTarget(const GuestDevice& dev, bool depth, uint32_t base,
+                                            uint32_t format, uint32_t pitch, uint32_t height) {
   pitch = std::clamp<uint32_t>(pitch, 1, 8192);
   height = std::clamp<uint32_t>(height, 1, 8192);
+  // The surface pitch is allocation stride, not the width of the pass. Street 4 keeps a
+  // 1280-pixel pitch for tiny lighting/reduction passes whose results the CPU reads.
+  // Use the guest window extent (or the full tiled scene), and cache native and scaled
+  // versions separately so a previous full-size pass cannot upscale those data passes.
+  uint32_t render_width = tiling_ ? pitch : std::min(pitch, dev.reg(0x2082) & 0x3FFF);
+  float scale = ScaleFor(render_width);
   uint64_t key = uint64_t(base) | (uint64_t(format) << 12) | (uint64_t(pitch) << 20) |
-                 (uint64_t(depth) << 40);
+                 (uint64_t(depth) << 40) | (uint64_t(scale != 1.0f) << 41);
   auto& slot = render_targets_[key];
   if (slot && slot->height >= height) {
     slot->last_used = frame_;
@@ -663,8 +735,9 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
   rt->width = pitch;
   rt->height = std::max(height, slot ? slot->height : 0u);
   D3D11_TEXTURE2D_DESC td{};
-  td.Width = rt->width;
-  td.Height = rt->height;
+  rt->scale = scale;
+  td.Width = ScaledSize(rt->width, rt->scale);
+  td.Height = ScaledSize(rt->height, rt->scale);
   td.MipLevels = 1;
   td.ArraySize = 1;
   td.SampleDesc.Count = 1;
@@ -696,7 +769,7 @@ RenderTarget* RendererImpl::GetRenderTarget(bool depth, uint32_t base, uint32_t 
   if (!rt->texture) return nullptr;
   if (slot && slot->texture) {
     // Keep the old contents when growing.
-    D3D11_BOX box{0, 0, 0, slot->width, slot->height, 1};
+    D3D11_BOX box{0, 0, 0, ScaledSize(slot->width, slot->scale), ScaledSize(slot->height, slot->scale), 1};
     context_->CopySubresourceRegion(rt->texture.get(), 0, 0, 0, 0, slot->texture.get(), 0, &box);
   }
   rt->last_used = frame_;
@@ -710,7 +783,9 @@ ResolvedTexture* RendererImpl::GetResolved(uint32_t address, uint32_t width, uin
   auto it = resolved_.find(address);
   if (it != resolved_.end()) {
     auto* r = it->second.get();
-    if (!create || (r->width >= width && r->height >= height &&
+    // Guest addresses are reused by differently sized passes; a native-size resolve must
+    // not inherit a scaled allocation from an earlier scene/post-processing destination.
+    if (!create || (r->width >= width && r->height >= height && r->scale == ScaleFor(width) &&
                     ResolveDestFormat(r->format) == ResolveDestFormat(format)))
       return r;
   }
@@ -721,8 +796,9 @@ ResolvedTexture* RendererImpl::GetResolved(uint32_t address, uint32_t width, uin
   r->height = std::clamp<uint32_t>(height, 1, 8192);
   r->format = format;
   D3D11_TEXTURE2D_DESC td{};
-  td.Width = r->width;
-  td.Height = r->height;
+  r->scale = ScaleFor(r->width);
+  td.Width = ScaledSize(r->width, r->scale);
+  td.Height = ScaledSize(r->height, r->scale);
   td.MipLevels = 1;
   td.ArraySize = 1;
   td.SampleDesc.Count = 1;
@@ -935,6 +1011,10 @@ ID3D11SamplerState* RendererImpl::GetSampler(const uint32_t f[6]) {
   uint32_t mag = (f[3] >> 19) & 3, min = (f[3] >> 21) & 3, mip = (f[3] >> 23) & 3;
   uint32_t aniso = (f[3] >> 25) & 7;
   uint32_t border = f[5] & 3;
+  // PC settings: anisotropic filtering forced on filtered (linear mip) fetches.
+  int forced_aniso = pcs::Anisotropy();
+  if (forced_aniso > 1 && min == 1 && mag == 1 && mip == 1)
+    aniso = std::max<uint32_t>(aniso == 7 ? 0 : aniso, uint32_t(std::countr_zero(unsigned(forced_aniso))) + 1);
   int32_t lod_bias = int32_t(f[4] << 10) >> 22;  // bits 12-21
   uint32_t mip_min = (f[4] >> 2) & 15, mip_max = (f[4] >> 6) & 15;
   uint64_t key = uint64_t(clamp_x) | (uint64_t(clamp_y) << 3) | (uint64_t(clamp_z) << 6) |
@@ -1202,7 +1282,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   if (!EnsureDevice()) return;
   ++frame_draws_;
   if (tiling_) ++frame_tiled_draws_;
-  const bool trace = TraceFrame(frame_);
+  bool trace = TraceFrame(frame_);
   if ((dev.reg(0x2208) & 7) != 4 && (dev.reg(0x2208) & 7) != 0) {
     // RB_MODECONTROL not in color+depth mode (copy/clear passes are handled by Resolve).
     if (trace) REXLOG_INFO("trace draw skip: modecontrol={:08X}", dev.reg(0x2208));
@@ -1246,6 +1326,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     pitch = tiling_width_;
     height = tiling_height_;
   }
+  if (!tiling_ && TraceSurface(width_scissor, height)) trace = true;
   uint32_t color_mask = dev.reg(0x2104);
   uint32_t color_written = ps ? ps->meta.color_outputs : 0;
   uint32_t active_mask = 0;
@@ -1256,7 +1337,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     bound_color_[i] = nullptr;
     if (!((color_mask >> (4 * i)) & 0xF) || !(color_written & (1u << i))) continue;
     uint32_t info = dev.reg(color_info_regs[i]);
-    auto* rt = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+    auto* rt = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
     if (!rt) continue;
     rtvs[i] = rt->rtv.get();
     bound_color_[i] = rt;
@@ -1270,7 +1351,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   bound_depth_ = nullptr;
   if ((depthcontrol & 0x3) != 0) {
     uint32_t info = dev.reg(0x2002);
-    if (auto* rt = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+    if (auto* rt = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
       dsv = rt->dsv.get();
       bound_depth_ = rt;
     }
@@ -1329,6 +1410,12 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   sys.alpha_test = dev.reg(0x2202) & 0xF;
   sys.alpha_ref = dev.reg_float(0x210E);
   for (int i = 0; i < 4; ++i) sys.rt_exp_scale[i] = exp_scale[i];
+  float rt_scale = 1.0f;
+  for (int i = 3; i >= 0; --i)
+    if (bound_color_[i]) rt_scale = bound_color_[i]->scale;
+  if (!active_mask && bound_depth_) rt_scale = bound_depth_->scale;
+  sys.res_scale[0] = rt_scale;
+  sys.res_scale[1] = 1.0f / rt_scale;
 
   // Textures (both stages share slots 0-31).
   ID3D11ShaderResourceView* srvs[32] = {};
@@ -1447,7 +1534,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   SetupStates(dev, active_mask, depth_active);
 
   // Viewport covers the whole surface; the guest viewport is applied in the shader.
-  D3D11_VIEWPORT vp{0, 0, float(pitch), float(height), 0.0f, 1.0f};
+  D3D11_VIEWPORT vp{0, 0, float(ScaledSize(pitch, rt_scale)), float(ScaledSize(height, rt_scale)), 0.0f, 1.0f};
   context_->RSSetViewports(1, &vp);
   uint32_t tl = dev.reg(0x2081), br = dev.reg(0x2082);
   LONG sx0 = LONG(tl & 0x3FFF), sy0 = LONG((tl >> 16) & 0x3FFF);
@@ -1475,18 +1562,22 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
       if (tex_mask & (1u << slot))
         tex += fmt::format(" t{}={:08X}{}", slot, LoadBE32(dev.fetch_constant(slot) + 4) & ~0xFFFu,
                            srvs[slot] ? "" : "(null)");
-    REXLOG_INFO("trace draw prim={} n={} vs={:08X} ps={:08X} c0={:08X} z={:08X} pitch={} h={} mask={:08X} "
+    REXLOG_INFO("trace draw prim={} n={} vs={:08X} ps={:08X} c0={:08X} z={:08X} pitch={} h={} scale={:g} mask={:08X} "
                 "act={:08X} dctl={:08X} woff={:08X} sc=({},{})-({},{}) vp=({:g},{:g},{:g},{:g}) vte={:08X}{}",
                 draw.primitive, draw.count, dev.u32(dev::kVertexShader), dev.u32(dev::kPixelShader),
-                dev.reg(0x2001), dev.reg(0x2002), pitch, height, color_mask, active_mask, depthcontrol,
+                dev.reg(0x2001), dev.reg(0x2002), pitch, height, rt_scale, color_mask, active_mask, depthcontrol,
                 window_offset, scissor.left, scissor.top, scissor.right, scissor.bottom, sys.viewport[0],
                 sys.viewport[1], sys.viewport[2], sys.viewport[3], sys.vte_flags, tex);
+    REXLOG_INFO("trace draw blend: blend0={:08X} colorctl={:08X} factor=({:g},{:g},{:g},{:g}) rt_fmt={} exp={:g}",
+                dev.reg(0x2201), dev.reg(0x2202), dev.reg_float(0x2105), dev.reg_float(0x2106),
+                dev.reg_float(0x2107), dev.reg_float(0x2108), (dev.reg(0x2001) >> 16) & 0xF, exp_scale[0]);
   }
   if (scissor.right <= scissor.left || scissor.bottom <= scissor.top) {
     if (trace) REXLOG_INFO("trace draw skip: empty scissor");
     return;
   }
-  context_->RSSetScissorRects(1, &scissor);
+  D3D11_RECT host_scissor = ScaledRect(scissor.left, scissor.top, scissor.right, scissor.bottom, rt_scale);
+  context_->RSSetScissorRects(1, &host_scissor);
 
   if (std::getenv("STREET4_DUMP_DRAW") && ps) {
     static std::string dumped;
@@ -1527,6 +1618,11 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     REXLOG_INFO("trace draw samples={} (vs={:08X} ps={:08X} n={}) vpz=({:g},{:g}) clip={:08X}", passed,
                 dev.u32(dev::kVertexShader), dev.u32(dev::kPixelShader), draw.count, sys.viewport_z[0],
                 sys.viewport_z[1], dev.reg(0x2204));
+    if (draw.primitive == 1)
+      REXLOG_INFO("trace draw points: point_size={:08X} point_minmax={:08X} line_cntl={:08X} vte={:08X} "
+                  "su_sc_mode={:08X} vs_writes_psize={}",
+                  dev.reg(0x2280), dev.reg(0x2281), dev.reg(0x2282), dev.reg(0x2206), dev.reg(0x2205),
+                  vs->meta.hlsl.find("o_misc.x") != std::string::npos);
     static std::unordered_map<uint64_t, int> consts_logged;
     uint64_t pair = (uint64_t(dev.u32(dev::kVertexShader)) << 32) | dev.u32(dev::kPixelShader);
     if (!passed && consts_logged[pair]++ == 0) {
@@ -1557,7 +1653,11 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
     static std::unordered_map<uint64_t, int> seen;
     uint64_t pair = (uint64_t(dev.u32(dev::kVertexShader)) << 32) | dev.u32(dev::kPixelShader);
-    if (dump_dir && !seen.count(pair) && seen.size() < 48) {
+    // STREET4_TRACE_DUMP_PER_TEXTURE=1: one dump per shader pair and texture 0 (passes that draw
+    // the same shaders with many textures, like lightmapped geometry).
+    static const bool per_texture = std::getenv("STREET4_TRACE_DUMP_PER_TEXTURE") != nullptr;
+    if (per_texture) pair ^= uint64_t(LoadBE32(dev.fetch_constant(0) + 4) & ~0xFFFu) * 0x9E3779B97F4A7C15ull;
+    if (dump_dir && !seen.count(pair) && seen.size() < (per_texture ? 400u : 48u)) {
       int n = int(seen.size());
       seen[pair] = n;
       {
@@ -1569,6 +1669,10 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
           c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(alu[1024 + i * 4]), AsFloat(alu[1024 + i * 4 + 1]),
                            AsFloat(alu[1024 + i * 4 + 2]), AsFloat(alu[1024 + i * 4 + 3]));
         REXLOG_INFO("trace psconst draw-{:02}:{}", int(seen.size()), c);
+        // Host-endian VS c0-c255 followed by PS c0-c255, including shader literals.
+        // In particular this preserves the CPU-generated crowd lighting for A/B checks.
+        std::ofstream(fmt::format("{}/draw-{:02}-constants.bin", dump_dir, n), std::ios::binary)
+            .write(reinterpret_cast<const char*>(alu.data()), alu.size() * 4);
       }
       REXLOG_INFO("trace dump draw-{:02} vs={:08X} ps={:08X} {} {}", n, dev.u32(dev::kVertexShader),
                   dev.u32(dev::kPixelShader), vs->name, ps ? ps->name : std::string("-"));
@@ -1619,10 +1723,12 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
           const uint8_t* mem = Physical(td2.base_address ? td2.base_address : td2.mip_address);
           for (uint32_t b = 0; b < 65536; ++b) nonzero += mem[b] != 0;
           REXLOG_INFO("trace tex draw-{:02} t{}: fetch={:08X} {:08X} {:08X} {:08X} {:08X} {:08X} fmt={} {}x{}x{} "
-                      "tiled={} packed={} base={:08X} mip={:08X} mips={}-{} nonzero64k={} resolved={}",
+                      "tiled={} packed={} base={:08X} mip={:08X} mips={}-{} nonzero64k={} resolved={} bound_resolved={} bgra={}",
                       n, slot, fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], td2.format, td2.width, td2.height,
                       td2.depth, td2.tiled, td2.packed_mips, td2.base_address, td2.mip_address, td2.mip_min,
-                      td2.mip_max, nonzero, resolved_.count(td2.base_address) != 0);
+                      td2.mip_max, nonzero, resolved_.count(td2.base_address) != 0,
+                      resolved_.count(td2.base_address) && resolved_[td2.base_address]->srv.get() == srvs[slot],
+                      resolved_.count(td2.base_address) && resolved_[td2.base_address]->bgra);
           std::string hex;
           for (uint32_t b = 0; b < 48; ++b) hex += fmt::format("{:02X}{}", mem[0x8000 + b], (b & 15) == 15 ? " " : "");
           REXLOG_INFO("trace tex draw-{:02} t{} bytes@8000: {}", n, slot, hex);
@@ -1637,7 +1743,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
 // --------------------------------------------------------------------------- blit
 void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11_VIEWPORT vp,
                           ID3D11ShaderResourceView* src, float, float, float u0, float v0,
-                          float u1, float v1, bool depth, bool swap_rb) {
+                          float u1, float v1, bool depth, bool swap_rb, bool point) {
   float cb[8] = {u0, v0, u1 - u0, v1 - v0, 1.0f, swap_rb ? 1.0f : 0.0f, 0, 0};
   D3D11_MAPPED_SUBRESOURCE m;
   if (SUCCEEDED(context_->Map(cb_blit_.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -1663,12 +1769,42 @@ void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11
   context_->VSSetConstantBuffers(0, 1, &b);
   context_->PSSetConstantBuffers(0, 1, &b);
   context_->PSSetShaderResources(0, 1, &src);
-  ID3D11SamplerState* s = linear_clamp_.get();
+  ID3D11SamplerState* s = point ? point_clamp_.get() : linear_clamp_.get();
   context_->PSSetSamplers(0, 1, &s);
   context_->Draw(3, 0);
   context_->PSSetShaderResources(0, 32, null_srvs);
 }
 
+
+// Internal resolution: the region of a scaled resolve result drawn at guest size, into a texture
+// kept per destination (tiled frames add their rectangles to the same one).
+ID3D11Texture2D* RendererImpl::GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y,
+                                             int32_t w, int32_t h) {
+  D3D11_TEXTURE2D_DESC td;
+  r.texture->GetDesc(&td);
+  auto& copy = writeback_scratch_[key];
+  D3D11_TEXTURE2D_DESC cur{};
+  if (copy.first) copy.first->GetDesc(&cur);
+  if (!copy.first || cur.Format != td.Format || cur.Width != r.width || cur.Height != r.height) {
+    D3D11_TEXTURE2D_DESC sd{r.width, r.height, 1, 1, td.Format, {1, 0}, D3D11_USAGE_DEFAULT,
+                            D3D11_BIND_RENDER_TARGET, 0, 0};
+    copy = {};
+    if (FAILED(device_->CreateTexture2D(&sd, nullptr, copy.first.put())) ||
+        FAILED(device_->CreateRenderTargetView(copy.first.get(), nullptr, copy.second.put())))
+      return nullptr;
+  }
+  w = std::min<int32_t>(w, int32_t(r.width) - x);
+  h = std::min<int32_t>(h, int32_t(r.height) - y);
+  if (w <= 0 || h <= 0) return nullptr;
+  D3D11_VIEWPORT vp{float(x), float(y), float(w), float(h), 0, 1};
+  // Data formats (depth, float channels) keep exact texels; colors are filtered.
+  bool point = td.Format == DXGI_FORMAT_R32_FLOAT || td.Format == DXGI_FORMAT_R32G32_FLOAT ||
+               td.Format == DXGI_FORMAT_R32G32B32A32_FLOAT;
+  float gw = float(r.width), gh = float(r.height);
+  BlitTo(copy.second.get(), r.width, r.height, vp, r.srv.get(), gw, gh, x / gw, y / gh, (x + w) / gw,
+         (y + h) / gh, false, false, point);
+  return copy.first.get();
+}
 
 // The GPU writes resolve results to memory (tiled, in the copy-destination endian); the game
 // reads some of them with the CPU (it compresses render-to-texture lightmaps and environment
@@ -1690,11 +1826,42 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     default: return;  // host layout differs from the guest one
   }
   if (r.format == 63) return;  // 7e3 float stored as half on the host
+  // Diagnostics: STREET4_WB_SKIP=<w>x<h>[,...] keeps results of those sizes out of guest memory.
+  if (static const char* skip = std::getenv("STREET4_WB_SKIP"); skip && *skip) {
+    std::string list = std::string(",") + skip + ",";
+    if (list.find(fmt::format(",{}x{},", w, h)) != std::string::npos) return;
+  }
+  // 4_4_4_4 destinations are RGBA8 on the host: packed back to 16-bit texels when stored.
+  const bool pack4444 = r.format == 15 && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
+  if (pack4444) bpp = 2;
+  // Internal resolution: everything below works on a guest-size copy of the result.
+  ID3D11Texture2D* source = r.texture.get();
+  if (r.scale != 1.0f) {
+    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, std::max(x, 0), std::max(y, 0), w, h);
+    if (!source) return;
+    source->GetDesc(&td);
+  }
   x = std::max(x, 0);
   y = std::max(y, 0);
-  w = std::min<int32_t>(w, int32_t(td.Width) - x);
-  h = std::min<int32_t>(h, int32_t(td.Height) - y);
+  w = std::min<int32_t>(w, int32_t(std::min<uint32_t>(td.Width, r.width)) - x);
+  h = std::min<int32_t>(h, int32_t(std::min<uint32_t>(td.Height, r.height)) - y);
   if (w <= 0 || h <= 0) return;
+  // Destinations resolved in every frame (the scene, post-processing chains) are render targets
+  // the GPU reads back; the CPU reads what is generated once (lightmaps at load time). Steady
+  // destinations reach memory once a second at the frame-late drain. The results in between are
+  // still queued: a fence wait stores those the CPU waits for. The load-time lightmap bake
+  // resolves to the same two destinations in every frame for hundreds of frames, and the CPU
+  // compresses each finished lightmap right after a fence wait; without its result the CPU read
+  // whatever an earlier depth resolve left there (the crowd and stands turned red).
+  WriteBackHistory& hist = writeback_history_[dest_base & 0x1FFFFFFF];
+  if (hist.last_frame != frame_) {
+    // (within 3 frames: double-buffered targets alternate between two destinations)
+    hist.streak = hist.last_frame != ~0ull && frame_ - hist.last_frame <= 3 ? hist.streak + 1 : 0;
+    hist.last_frame = frame_;
+  }
+  const bool steady = hist.streak >= 4;
+  const bool throttled = steady && hist.queued_frame != frame_ && frame_ - hist.queued_frame < 60;
+  if (!throttled) hist.queued_frame = frame_;
   Com<ID3D11Texture2D> staging;
   for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
     D3D11_TEXTURE2D_DESC sd;
@@ -1711,9 +1878,10 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     if (FAILED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) return;
   }
   D3D11_BOX box{UINT(x), UINT(y), 0, UINT(x + w), UINT(y + h), 1};
-  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, r.texture.get(), 0, &box);
+  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, &box);
   writebacks_.push_back(
-      {std::move(staging), dest_base & 0x1FFFFFFF, dest_pitch, endian, bpp, x, y, w, h, frame_, fence});
+      {std::move(staging), dest_base & 0x1FFFFFFF, dest_pitch, endian, bpp, x, y, w, h, frame_, fence,
+       steady, throttled, pack4444, MemorySnapshot(dest_base, dest_pitch, bpp, y, h)});
   ++writebacks_by_address_[dest_base & 0x1FFFFFFF];
 }
 
@@ -1738,30 +1906,104 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
     stat_frame = frame_;
   }
   // A wait for `fence` needs the results of the work issued up to it: resolves queued while the
-  // library's timestamp was `fence` are needed too (the game reads them after that wait).
-  while (!writebacks_.empty() && (all ? int32_t(writebacks_.front().fence - fence) <= 0
-                                      : writebacks_.front().frame < frame_)) {
-    PendingWriteBack p = std::move(writebacks_.front());
-    writebacks_.pop_front();
+  // library's timestamp was `fence` are needed too (the game reads them after that wait). That
+  // includes steady destinations: the CPU may be waiting precisely for one of them.
+  for (size_t i = 0; i < writebacks_.size();) {
+    const PendingWriteBack& f = writebacks_[i];
+    if (all ? int32_t(f.fence - fence) > 0 : f.frame >= frame_) break;
+    PendingWriteBack p = std::move(writebacks_[i]);
+    writebacks_.erase(writebacks_.begin() + i);
     // Results the GPU overwrites every frame (post-processing chains, the scene) are already
     // superseded by a resolve of the same rectangle in a later frame; storing each of them would
     // cost more than the frame, so they reach memory every few frames. Resolves of the same
     // frame (content generated at load time, read back by the CPU one after another) are kept.
     bool superseded = false;
+    // (at a fence wait, only by a result that is stored in this same wait)
     for (const auto& q : writebacks_)
       if (q.frame > p.frame && q.dest_base == p.dest_base && q.x <= p.x && q.y <= p.y &&
-          q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h) {
+          q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h && (!all || int32_t(q.fence - fence) <= 0)) {
         superseded = true;
         break;
       }
     uint64_t& last_stored = writeback_last_stored_[p.dest_base];
-    bool store = !superseded || frame_ - last_stored >= 8;
+    // Throttled steady results are stored only when the CPU waits for them in the frame they were
+    // resolved in (the lightmap bake reads each result right away); waits for the previous frame
+    // (frame pacing, in every frame) do not store the scene and post-processing chains again.
+    bool store = (all ? !p.throttled || p.frame == frame_ : !p.throttled) &&
+                 (!superseded || frame_ - last_stored >= 8);
+    // Diagnostics: a stored result overlapping vertex data drawn in the last frames.
+    static const bool vb_check = std::getenv("STREET4_WB_VBCHECK") != nullptr;
+    if (vb_check && store) {
+      uint32_t extent = ((p.dest_pitch + 31) & ~31u) * ((uint32_t(p.y + p.h) + 31) & ~31u) * p.bpp;
+      static std::set<uint64_t> reported;
+      for (const auto& [key, vb] : vertex_buffers_) {
+        uint32_t vb_base = uint32_t(key), vb_bytes = uint32_t(key >> 32);
+        if (frame_ - vb->last_used > 2 || vb_base + vb_bytes <= p.dest_base || vb_base >= p.dest_base + extent) continue;
+        if (reported.insert((uint64_t(p.dest_base) << 32) | vb_base).second)
+          REXLOG_INFO("street4 write-back {:08X} {}x{} bpp={} (extent {:X}) overlaps vertex buffer {:08X}+{:X}",
+                      p.dest_base, p.w, p.h, p.bpp, extent, vb_base, vb_bytes);
+      }
+    }
+    // The CPU rewrote the destination after the resolve (the memory was reused): the late result
+    // would clobber its data.
+    static uint64_t clobbers_avoided = 0;
+    if (store && MemorySnapshot(p.dest_base, p.dest_pitch, p.bpp, p.y, p.h) != p.snapshot) {
+      store = false;
+      if (clobbers_avoided++ < 20 || (clobbers_avoided & 1023) == 0)
+        REXLOG_INFO("street4 write-back skipped: {:08X} {}x{} rewritten by the CPU since frame {} ({} so far)",
+                    p.dest_base, p.w, p.h, p.frame, clobbers_avoided);
+    }
     if (store) last_stored = frame_;
     ++(store ? stat_stored : stat_skipped);
     if (all) ++stat_forced;
     if (store) stat_bytes += uint64_t(p.w) * p.h * p.bpp;
     D3D11_MAPPED_SUBRESOURCE m;
     if (store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+      // Diagnostics: STREET4_DUMP_WB=<w>x<h>[,...] writes the first stored results of those sizes (host
+      // texel order, color and alpha) as BMPs to STREET4_WB_DIR.
+      // STREET4_WB_LOG=1: per-byte averages of small stored results (A/B comparisons).
+      static const bool wb_log = std::getenv("STREET4_WB_LOG") != nullptr;
+      static int wb_logs = 0;
+      if (wb_log && wb_logs < 600) {
+        ++wb_logs;
+        uint64_t sum[16] = {};
+        uint32_t step = std::max<uint32_t>(1, uint32_t(p.w * p.h) / 4096);
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < uint32_t(p.w * p.h); i += step, ++n) {
+          const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(i / p.w) * m.RowPitch +
+                             size_t(i % p.w) * (p.pack4444 ? 4 : p.bpp);
+          for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) sum[b] += s[b];
+        }
+        std::string avg;
+        for (uint32_t b = 0; b < std::min<uint32_t>(p.bpp, 16); ++b) avg += fmt::format(" {}", n ? sum[b] / n : 0);
+        REXLOG_INFO("street4 wb-log {:08X} {}x{} at ({},{}) bpp={} endian={} frame={} avg:{}", p.dest_base, p.w, p.h,
+                    p.x, p.y, p.bpp, p.endian, p.frame, avg);
+      }
+      static const char* dump_wb = std::getenv("STREET4_DUMP_WB");
+      static int dumped_wb = 0;
+      if (dump_wb && p.bpp == 4 && dumped_wb < 400 && std::getenv("STREET4_WB_DIR") &&
+          (std::string(",") + dump_wb + ",").find(fmt::format(",{}x{},", p.w, p.h)) != std::string::npos) {
+        uint32_t row = (uint32_t(p.w) * 3 + 3) & ~3u;
+        for (int pass = 0; pass < 2; ++pass) {
+          std::vector<uint8_t> bmp(54 + size_t(row) * p.h, 0);
+          auto put32 = [&](size_t o, uint32_t v) { std::memcpy(&bmp[o], &v, 4); };
+          bmp[0] = 'B'; bmp[1] = 'M';
+          put32(2, uint32_t(bmp.size())); put32(10, 54); put32(14, 40); put32(18, uint32_t(p.w));
+          put32(22, uint32_t(-p.h)); bmp[26] = 1; bmp[28] = 24;
+          for (int32_t yy = 0; yy < p.h; ++yy)
+            for (int32_t xx = 0; xx < p.w; ++xx) {
+              const uint8_t* s = static_cast<const uint8_t*>(m.pData) + size_t(yy) * m.RowPitch + xx * 4;
+              uint8_t* o = &bmp[54 + size_t(yy) * row + xx * 3];
+              if (pass == 0) { o[0] = s[2]; o[1] = s[1]; o[2] = s[0]; }  // bytes 0,1,2 as R,G,B
+              else o[0] = o[1] = o[2] = s[3];
+            }
+          std::ofstream(fmt::format("{}/wb-{:03}-{:08X}-{}x{}-f{}-{}.bmp", std::getenv("STREET4_WB_DIR"), dumped_wb,
+                                    p.dest_base, p.w, p.h, p.frame, pass ? "a" : "rgb"), std::ios::binary)
+              .write(reinterpret_cast<const char*>(bmp.data()), std::streamsize(bmp.size()));
+        }
+        ++dumped_wb;
+        REXLOG_INFO("street4 write-back dump {:08X} {}x{} endian={} frame={}", p.dest_base, p.w, p.h, p.endian, frame_);
+      }
       uint32_t log2_bpp = p.bpp == 1 ? 0 : p.bpp == 2 ? 1 : p.bpp == 4 ? 2 : p.bpp == 8 ? 3 : 4;
       uint32_t pitch = (p.dest_pitch + 31) & ~31u;
       // Runs of texels that stay contiguous in the tiled layout (16 bytes, up to 8 texels).
@@ -1775,7 +2017,18 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
           uint32_t off = p.dest_base + uint32_t(TiledOffset2D(px, py, pitch, log2_bpp));
           uint32_t bytes = uint32_t(n) * p.bpp;
           if (off + bytes <= 0x20000000u) {
-            const uint8_t* src = src_row + size_t(col) * p.bpp;
+            const uint8_t* src = src_row + size_t(col) * (p.pack4444 ? 4 : p.bpp);
+            uint8_t packed[16];
+            if (p.pack4444) {
+              // Channel c in bits 4c..4c+3 (as the texture loader reads 4_4_4_4).
+              for (int32_t i = 0; i < n; ++i) {
+                uint16_t v = 0;
+                for (int c = 0; c < 4; ++c) v |= uint16_t((src[i * 4 + c] * 15 + 127) / 255) << (4 * c);
+                packed[i * 2] = uint8_t(v);
+                packed[i * 2 + 1] = uint8_t(v >> 8);
+              }
+              src = packed;
+            }
             uint8_t* dst = mem + off;
             if (p.endian == 0 || p.bpp == 1) {
               std::memcpy(dst, src, bytes);
@@ -1804,6 +2057,11 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
         }
       }
       context_->Unmap(p.staging.get(), 0);
+    }
+    if (store) {
+      // Later results for the same destination compare against what was just stored.
+      for (auto& q : writebacks_)
+        if (q.dest_base == p.dest_base) q.snapshot = MemorySnapshot(q.dest_base, q.dest_pitch, q.bpp, q.y, q.h);
     }
     if (staging_pool_.size() < 64) staging_pool_.push_back(std::move(p.staging));
     auto it = writebacks_by_address_.find(p.dest_base);
@@ -1887,6 +2145,25 @@ void RendererImpl::DumpTexture(ID3D11Texture2D* texture, const std::string& path
               lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]);
 }
 
+// Diagnostics: first 4 bytes of one texel.
+uint32_t RendererImpl::ReadPixel(ID3D11Texture2D* texture, uint32_t x, uint32_t y) {
+  D3D11_TEXTURE2D_DESC td;
+  texture->GetDesc(&td);
+  if (x >= td.Width || y >= td.Height) return 0;
+  D3D11_TEXTURE2D_DESC sd{1, 1, 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0};
+  Com<ID3D11Texture2D> staging;
+  if (FAILED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) return 0;
+  D3D11_BOX box{x, y, 0, x + 1, y + 1, 1};
+  context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, texture, 0, &box);
+  D3D11_MAPPED_SUBRESOURCE m;
+  uint32_t v = 0;
+  if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+    std::memcpy(&v, m.pData, 4);
+    context_->Unmap(staging.get(), 0);
+  }
+  return v;
+}
+
 // --------------------------------------------------------------------------- resolve
 void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
   if (!EnsureDevice()) return;
@@ -1909,17 +2186,28 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
   RenderTarget* src = nullptr;
   if (src_select == 4) {
     uint32_t info = dev.reg(0x2002);
-    src = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height);
+    src = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height);
   } else {
     const uint32_t regs[4] = {0x2001, 0x2003, 0x2004, 0x2005};
     uint32_t info = dev.reg(regs[src_select & 3]);
-    src = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+    src = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
   }
   if (!src) return;
-  if (TraceFrame(frame_))
-    REXLOG_INFO("trace resolve flags={:X} copyctl={:08X} has_dest={} rect=({},{})-({},{}) surface={:08X} c0={:08X} z={:08X}",
+  const bool surface_trace = !tiling_ && TraceSurface(window_br & 0x3FFF, height);
+  if (TraceFrame(frame_) || surface_trace)
+    REXLOG_INFO("trace resolve flags={:X} copyctl={:08X} has_dest={} rect=({},{})-({},{}) surface={:08X} c0={:08X} z={:08X}"
+                " src_select={} clear_color={} clear_depth={} color_clear_reg={:08X} dest={:08X} frame={}",
                 req.flags, copy_control, req.has_dest, req.src_x0, req.src_y0, req.src_x1, req.src_y1,
-                surface, dev.reg(0x2001), dev.reg(0x2002));
+                surface, dev.reg(0x2001), dev.reg(0x2002), src_select, clear_color, clear_depth, dev.reg(0x231E),
+                dev.reg(0x2319), frame_);
+  if (surface_trace && !src->depth) {
+    // The source as it is resolved (before any clear), to follow generated maps pass by pass.
+    static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
+    static int surface_dumps = 0;
+    if (dump_dir && surface_dumps < 200)
+      DumpTexture(src->texture.get(), fmt::format("{}/surface-{:03}-f{}-to-{:08X}.bmp", dump_dir, surface_dumps++,
+                                                  frame_, dev.reg(0x2319)));
+  }
   int32_t x0 = req.src_x0, y0 = req.src_y0, x1 = req.src_x1, y1 = req.src_y1;
   if (x1 < 0) { x0 = 0; y0 = 0; x1 = int32_t(src->width); y1 = int32_t(height); }
   x1 = std::min<int32_t>(x1, int32_t(src->width));
@@ -1939,15 +2227,21 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
     if (frame_ < 5 || TraceFrame(frame_) ||
         seen_resolves.insert((uint64_t(dest_base) << 32) | (dest_pitch << 16) ^ (dest_height << 6) ^ dest_format).second)
       REXLOG_INFO("street4 resolve: src rt base={} fmt={} depth={} rect=({},{})-({},{}) -> dest "
-                  "{:08X} pitch={} h={} fmt={} at ({},{}) dest_info={:08X}",
+                  "{:08X} pitch={} h={} fmt={} at ({},{}) dest_info={:08X} endian={} rb_swap={}",
                   src->edram_base, src->format, src->depth, x0, y0, x1, y1, dest_base, dest_pitch,
-                  dest_height, dest_format, dst_x, dst_y, dest_info);
+                  dest_height, dest_format, dst_x, dst_y, dest_info, req.dest_endian,
+                  req.dest_red_blue_swap);
+    if (TraceSurface(uint32_t(x1 - x0), uint32_t(y1 - y0)))
+      REXLOG_INFO("trace resolve rect-match: window={}x{} surface pitch={} src {}x{} scale={:g} -> dest {:08X} fmt={} frame={}",
+                  window_br & 0x3FFF, height, pitch, src->width, src->height, src->scale, dest_base, dest_format,
+                  frame_);
     if (auto* dst = GetResolved(dest_base & 0x1FFFFFFF, dest_pitch, dest_height, dest_format, true)) {
-      D3D11_VIEWPORT vp{float(dst_x), float(dst_y), float(x1 - x0), float(y1 - y0), 0, 1};
+      D3D11_RECT hr = ScaledRect(dst_x, dst_y, dst_x + (x1 - x0), dst_y + (y1 - y0), dst->scale);
+      D3D11_VIEWPORT vp{float(hr.left), float(hr.top), float(hr.right - hr.left), float(hr.bottom - hr.top), 0, 1};
       float sw = float(src->width), sh = float(src->height);
       // The GPU stores 8_8_8_8 resolves as BGRA; games sample them with a fetch swizzle that
       // swaps red and blue back (60A), so the host copy keeps that order (as in BF2 / Street 3).
-      bool swap = !src->depth && src->format <= 1 && (dest_format == 6 || dest_format == 62) &&
+      bool swap = !src->depth && src->format <= 1 && (dest_format == 6 || dest_format == 62 || dest_format == 15) &&
                   req.dest_red_blue_swap != 0;
       dst->bgra = swap;
       BlitTo(dst->rtv.get(), dst->width, dst->height, vp, src->srv.get(), sw, sh, x0 / sw, y0 / sh,
@@ -1961,6 +2255,13 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
       uint32_t sample = std::min<uint32_t>(4096, dest_pitch * dest_height);
       dst->guest_hash = Hash64(Physical(dest_base), sample);
       dst->frame = frame_;
+      if (TraceFrame(frame_) && !src->depth)
+        REXLOG_INFO("trace resolve pixels swap={} src L={:08X} R={:08X} dst L={:08X} R={:08X} ({}x{})", swap,
+                    ReadPixel(src->texture.get(), src->width / 4, src->height / 2),
+                    ReadPixel(src->texture.get(), src->width * 3 / 4, src->height / 2),
+                    ReadPixel(dst->texture.get(), dst->width / 4, dst->height / 2),
+                    ReadPixel(dst->texture.get(), dst->width * 3 / 4, dst->height / 2), dst->width,
+                    dst->height);
       static const char* dump_dir = std::getenv("STREET4_SHOT_DIR");
       static int dumps = 0;
       if (dump_dir && TraceFrame(frame_) && dumps < 64)
@@ -1996,12 +2297,12 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
         rgba[2] = h2f(lo >> 16); rgba[3] = h2f(lo & 0xFFFF);
       }
     }
-    D3D11_RECT r{x0, y0, x1, y1};
+    D3D11_RECT r = ScaledRect(x0, y0, x1, y1, src->scale);
     context1_->ClearView(src->rtv.get(), rgba, &r, 1);
   }
   if (clear_depth) {
     uint32_t info = dev.reg(0x2002);
-    if (auto* d = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+    if (auto* d = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
       uint32_t dv = dev.reg(0x231D);
       float z = d->format == 1 ? 0.0f : float(dv >> 8) / 16777215.0f;
       if (d->format == 1) {
@@ -2025,19 +2326,20 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
     pitch = tiling_width_;
     height = tiling_height_;
   }
-  if (TraceFrame(frame_))
+  if (TraceFrame(frame_) || (!tiling_ && TraceSurface(dev.reg(0x2082) & 0x3FFF, height)))
     REXLOG_INFO("trace clear z={:g} targets={:X} depth={} stencil={} rects={} c0={:08X} z={:08X} pitch={} h={} rgba=({:g},{:g},{:g},{:g})",
                 z, color_targets, depth, stencil, rect_count, dev.reg(0x2001), dev.reg(0x2002), pitch, height,
                 rgba[0], rgba[1], rgba[2], rgba[3]);
   std::vector<D3D11_RECT> r;
-  for (uint32_t i = 0; i < rect_count; ++i)
-    r.push_back({rects[i * 4], rects[i * 4 + 1], rects[i * 4 + 2], rects[i * 4 + 3]});
   const uint32_t regs[4] = {0x2001, 0x2003, 0x2004, 0x2005};
   for (int i = 0; i < 4; ++i) {
     if (!(color_targets & (1u << i))) continue;
     uint32_t info = dev.reg(regs[i]);
-    auto* rt = GetRenderTarget(false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
+    auto* rt = GetRenderTarget(dev, false, info & 0xFFF, (info >> 16) & 0xF, pitch, height);
     if (!rt) continue;
+    r.clear();
+    for (uint32_t k = 0; k < rect_count; ++k)
+      r.push_back(ScaledRect(rects[k * 4], rects[k * 4 + 1], rects[k * 4 + 2], rects[k * 4 + 3], rt->scale));
     if (!r.empty() && context1_)
       context1_->ClearView(rt->rtv.get(), rgba, r.data(), UINT(r.size()));
     else
@@ -2045,7 +2347,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
   }
   if (depth || stencil) {
     uint32_t info = dev.reg(0x2002);
-    if (auto* d = GetRenderTarget(true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
+    if (auto* d = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
       // Depth-stencil views cannot be cleared per rectangle in D3D11; rectangles that
       // cover less than the surface are rare for depth and cleared fully.
       context_->ClearDepthStencilView(
@@ -2071,8 +2373,6 @@ void RendererImpl::Present(const uint8_t* fetch) {
   uint32_t f[6];
   for (int k = 0; k < 6; ++k) f[k] = LoadBE32(fetch + k * 4);
   TextureDesc desc = TextureDescFromFetch(f);
-  float clear[4] = {0, 0, 0, 1};
-  context_->ClearRenderTargetView(backbuffer_rtv_.get(), clear);
   ID3D11ShaderResourceView* src = nullptr;
   bool src_bgra = false;
   float sw = float(desc.width), sh = float(desc.height);
@@ -2117,10 +2417,10 @@ void RendererImpl::Present(const uint8_t* fetch) {
         for (uint32_t y = 0; y < td.Height; y += 16)
           for (uint32_t x = 0; x < td.Width; x += 16, ++n) {
             const uint8_t* p = static_cast<const uint8_t*>(m.pData) + y * m.RowPitch + x * 4;
-            for (int c = 0; c < 4; ++c) sum[c] += p[c];
+            for (int c = 0; c < 4; ++c) sum[c] += p[src_bgra && c != 1 && c != 3 ? 2 - c : c];
           }
         if (take_shot) {
-          // Diagnostics: write the guest front buffer as a 24-bit BMP.
+          // Diagnostics: write the guest front buffer as a 24-bit BMP (as presented).
           char name[512];
           snprintf(name, sizeof(name), "%s/frame-%06llu.bmp", shot_dir,
                    static_cast<unsigned long long>(frame_));
@@ -2140,9 +2440,9 @@ void RendererImpl::Present(const uint8_t* fetch) {
           for (uint32_t y = 0; y < h; ++y) {
             const uint8_t* p = static_cast<const uint8_t*>(m.pData) + (h - 1 - y) * m.RowPitch;
             for (uint32_t x = 0; x < w; ++x) {
-              line[x * 3] = p[x * 4 + 2];
+              line[x * 3] = p[x * 4 + (src_bgra ? 0 : 2)];
               line[x * 3 + 1] = p[x * 4 + 1];
-              line[x * 3 + 2] = p[x * 4];
+              line[x * 3 + 2] = p[x * 4 + (src_bgra ? 2 : 0)];
             }
             f.write(reinterpret_cast<char*>(line.data()), row);
           }
@@ -2153,47 +2453,30 @@ void RendererImpl::Present(const uint8_t* fetch) {
       }
     }
   }
+  // Final picture, settings menu, vsync and frame pacing: pc_settings.cpp.
+  pcs::Picture picture;
   if (src) {
-    // Letterbox to the guest aspect ratio.
-    float gw = float(desc.width), gh = float(desc.height);
-    float scale = std::min(float(bb_width_) / gw, float(bb_height_) / gh);
-    float w = gw * scale, h = gh * scale;
-    D3D11_VIEWPORT vp{(float(bb_width_) - w) * 0.5f, (float(bb_height_) - h) * 0.5f, w, h, 0, 1};
-    BlitTo(backbuffer_rtv_.get(), bb_width_, bb_height_, vp, src, sw, sh, 0, 0, gw / sw, gh / sh,
-           false, src_bgra);
+    picture.srv = src;
+    picture.width = float(desc.width);
+    picture.height = float(desc.height);
+    picture.u1 = float(desc.width) / sw;
+    picture.v1 = float(desc.height) / sh;
+    picture.swap_rb = src_bgra;
   }
-  static const bool vsync = [] {
-    // PC options written by fifastreet4_options.exe (Vsync=0/1), next to the executable.
-    wchar_t path[MAX_PATH];
-    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring ini(path, n);
-    ini = ini.substr(0, ini.find_last_of(std::wstring{wchar_t(92), L'/'}) + 1) + L"fifastreet4-pc.ini";
-    return GetPrivateProfileIntW(L"PC", L"Vsync", 1, ini.c_str()) != 0;
-  }();
-  // Never wait for the host vertical blank in Present: with a sync interval DXGI can block
-  // for seconds at a time (3000 ms observed) when DWM is not composing the window, which
-  // stalled boot. Frames are paced on the CPU instead (as in the Street 3 / BF2 ports);
-  // the Vsync option keeps the 60 Hz cadence, off lets the game run unpaced.
   auto present_start = std::chrono::steady_clock::now();
-  HRESULT present_hr = swap_chain_->Present(0, 0);
+  pcs::Present(device_.get(), context_.get(), swap_chain_.get(), picture,
+               [this](ID3D11RenderTargetView** rtv, uint32_t* w, uint32_t* h) {
+                 if (!EnsureSwapChain()) return false;
+                 *rtv = backbuffer_rtv_.get();
+                 *w = bb_width_;
+                 *h = bb_height_;
+                 return true;
+               });
   auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - present_start).count();
   static int slow_logs = 0;
-  if (present_ms > 100 && slow_logs++ < 20)
-    REXLOG_WARN("street4 present #{}: swap chain Present took {} ms (hr={:08X})", frame_, present_ms,
-                uint32_t(present_hr));
-  if (vsync) {
-    using clock = std::chrono::steady_clock;
-    const auto interval = std::chrono::nanoseconds(16666667);
-    auto now = clock::now();
-    if (now - next_present_ > interval * 4) next_present_ = now;  // fell behind (loading)
-    next_present_ += interval;
-    if (next_present_ > now) {
-      if (next_present_ - now > std::chrono::milliseconds(2))
-        std::this_thread::sleep_for(next_present_ - now - std::chrono::milliseconds(2));
-      while (clock::now() < next_present_) std::this_thread::yield();
-    }
-  }
+  if (present_ms > 100 && !pcs::MenuOpen() && slow_logs++ < 20)
+    REXLOG_WARN("street4 present #{}: present took {} ms", frame_, present_ms);
   if (std::getenv("STREET4_FRAME_STATS") && (frame_ % 30) < 4)
     REXLOG_INFO("street4 frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
                 frame_tiled_draws_, frame_tilings_);
