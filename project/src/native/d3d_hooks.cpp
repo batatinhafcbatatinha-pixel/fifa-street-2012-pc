@@ -9,6 +9,8 @@
 // Addresses and ABIs: NATIVE_PLAN.md and hle/d3d_functions.json.
 
 #include <rex/hook.h>
+#include "../pc_settings.h"
+#include "post_effects.h"
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/runtime.h>
@@ -533,3 +535,34 @@ REX_HOOK_RAW(sub_827160B0) {
   static std::atomic<int> logged{0};
   if (logged++ < 20) REXLOG_INFO("street4 GPU hang recovery lr={:08X} -> {}", lr, ctx.r3.u32);
 }
+
+
+// Read-only exploration of effect predicates and render entry points.
+// Do not expose an effect until an active-effect capture verifies its switch.
+#define FX_PROBE(fn, label) \
+  REX_EXTERN(__imp__##fn); \
+  REX_HOOK_RAW(fn) { \
+    __imp__##fn(ctx, base); \
+    static const bool probe = std::getenv("STREET4_FX_PROBE") != nullptr; \
+    if (probe) { \
+      static std::atomic<unsigned> seen{0}; \
+      unsigned bit = ctx.r3.u32 ? 2u : 1u; \
+      if (!(seen.fetch_or(bit) & bit)) \
+        REXLOG_INFO("street4 fx predicate: {} result={} lr={:08X}", label, ctx.r3.u32, uint32_t(ctx.lr)); \
+    } \
+  }
+FX_PROBE(sub_82B5F3E0, "bloom")
+FX_PROBE(sub_82B5E7A8, "motion_blur")
+#undef FX_PROBE
+
+#define FX_RENDER_PROBE(fn, label) \
+  REX_EXTERN(__imp__##fn); \
+  REX_HOOK_RAW(fn) { \
+    static const bool probe = std::getenv("STREET4_FX_PROBE") != nullptr; \
+    static std::atomic<bool> seen{false}; \
+    if (probe && !seen.exchange(true)) REXLOG_INFO("street4 fx render entry: {}", label); \
+    __imp__##fn(ctx, base); \
+  }
+FX_RENDER_PROBE(sub_82B5FD78, "bloom")
+FX_RENDER_PROBE(sub_82B5F128, "motion_blur")
+#undef FX_RENDER_PROBE

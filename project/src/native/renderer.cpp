@@ -34,6 +34,7 @@
 #include <rex/ui/window.h>
 
 #include "renderer.h"
+#include "render_profile.h"
 #include "pc_game_info.h"
 #include "shader_translator.h"
 #include "texture_loader.h"
@@ -41,6 +42,15 @@
 namespace street4 {
 
 namespace {
+// Same as TiledOffset2D (texture_loader.cpp), inlined for the resolve write-back loop.
+inline int32_t TiledOffset2DInline(int32_t x, int32_t y, uint32_t pitch, uint32_t log2_bpb) {
+  pitch = (pitch + 31) & ~31u;
+  int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (log2_bpb + 7);
+  int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << log2_bpb;
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
 
 template <typename T>
 struct Com {
@@ -281,6 +291,7 @@ float ps_depth(O i) : SV_Target { return src.SampleLevel(samp, i.uv, 0).r; }
 )HLSL";
 
 struct ShaderEntry {
+  ea_postfx::Pass effect_pass = ea_postfx::Pass::Other;
   TranslatedShader meta;
   std::string name;
   Com<ID3D11VertexShader> vs;
@@ -303,6 +314,7 @@ struct RenderTarget {
 };
 
 struct HostTexture {
+  std::vector<uint8_t> validation_bytes;
   TextureDesc desc;
   Com<ID3D11Texture2D> texture;
   Com<ID3D11ShaderResourceView> srv2d, srv_array, srv_cube;
@@ -327,6 +339,7 @@ struct ResolvedTexture {
 };
 
 struct VertexBufferEntry {
+  std::vector<uint8_t> validation_bytes;
   Com<ID3D11Buffer> buffer;
   Com<ID3D11ShaderResourceView> srv;
   uint32_t capacity = 0;
@@ -419,10 +432,11 @@ class RendererImpl {
   uint8_t* membase_ = nullptr;
   uint8_t* physbase_ = nullptr;
   uint64_t frame_ = 0;
-  float scale_ = 1.0f;  // internal resolution (pcs::ResolutionScale), fixed at boot
+  float scale_ = 1.0f;  // internal resolution (pcs::ResolutionScale), re-read after each frame
   // Guest-size copies of scaled resolve results on their way to guest memory, by destination.
   std::unordered_map<uint32_t, std::pair<Com<ID3D11Texture2D>, Com<ID3D11RenderTargetView>>> writeback_scratch_;
   std::chrono::steady_clock::time_point next_present_{};
+  bool texture_reloaded_ = false;  // diagnostics: the slot being loaded replaced changed guest data
   uint32_t frame_draws_ = 0, frame_tiled_draws_ = 0, frame_tilings_ = 0;
   bool tiling_ = false;
   uint32_t tiling_width_ = 0, tiling_height_ = 0;
@@ -475,6 +489,8 @@ class RendererImpl {
 
   // Per-draw resources.
   Com<ID3D11Buffer> cb_vs_, cb_ps_, cb_sys_, cb_blit_;
+  std::array<uint32_t, 1024> last_vs_constants_{}, last_ps_constants_{};
+  bool vs_constants_valid_ = false, ps_constants_valid_ = false;
   Com<ID3D11Buffer> index_buffer_;
   uint32_t index_capacity_ = 0;
   Com<ID3D11GeometryShader> rect_gs_;
@@ -654,6 +670,7 @@ bool RendererImpl::Compile(const std::string& source, const char* entry, const c
 
 ShaderEntry* RendererImpl::GetShader(ShaderStage stage, const ShaderMicrocode& code,
                                      const ShaderKey& key) {
+  RenderPhase profile(RenderProfile::Shader);
   if ((!code.address && !code.host) || !code.dword_count || code.dword_count > 0x10000) return nullptr;
   const uint8_t* src = code.host ? code.host : Virtual(code.address);
   uint64_t hash = Hash64(src, code.dword_count * 4, uint64_t(stage) + 1) ^ (key.Pack() * 0x9E37ull);
@@ -667,6 +684,7 @@ ShaderEntry* RendererImpl::GetShader(ShaderStage stage, const ShaderMicrocode& c
   snprintf(name, sizeof(name), "%s_%016llx", stage == ShaderStage::kVertex ? "vs" : "ps",
            static_cast<unsigned long long>(hash));
   entry->name = name;
+  entry->effect_pass = ea_postfx::Identify(hash);
   // Diagnostics: <cache>/<name>.override.hlsl replaces the translated source.
   bool overridden = false;
   {
@@ -718,7 +736,7 @@ RenderTarget* RendererImpl::GetRenderTarget(const GuestDevice& dev, bool depth, 
   uint64_t key = uint64_t(base) | (uint64_t(format) << 12) | (uint64_t(pitch) << 20) |
                  (uint64_t(depth) << 40) | (uint64_t(scale != 1.0f) << 41);
   auto& slot = render_targets_[key];
-  if (slot && slot->height >= height) {
+  if (slot && slot->height >= height && slot->scale == scale) {
     slot->last_used = frame_;
     return slot.get();
   }
@@ -762,7 +780,7 @@ RenderTarget* RendererImpl::GetRenderTarget(const GuestDevice& dev, bool depth, 
     context_->ClearRenderTargetView(rt->rtv.get(), zero);
   }
   if (!rt->texture) return nullptr;
-  if (slot && slot->texture) {
+  if (slot && slot->texture && slot->scale == rt->scale) {
     // Keep the old contents when growing.
     D3D11_BOX box{0, 0, 0, ScaledSize(slot->width, slot->scale), ScaledSize(slot->height, slot->scale), 1};
     context_->CopySubresourceRegion(rt->texture.get(), 0, 0, 0, 0, slot->texture.get(), 0, &box);
@@ -812,6 +830,7 @@ ResolvedTexture* RendererImpl::GetResolved(uint32_t address, uint32_t width, uin
 ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], TextureDimension dim,
                                                    float size_out[4],
                                                    ID3D11ShaderResourceView** volume_out) {
+  RenderPhase profile(RenderProfile::Texture);
   // Type 2 = texture. Type 0 ("invalid texture") constants with a valid address and format
   // are bound by this game for real textures (screen-space buffers, shadow terms); the GPU
   // samples them anyway (Xenia: gpu_allow_invalid_fetch_constants), so accept them too.
@@ -866,6 +885,25 @@ ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], Text
   }
   uint64_t key = Hash64(&desc, sizeof(desc));
   auto& slot = textures_[key];
+  static const bool compare_textures = !std::getenv("STREET4_NO_TEXTURE_COMPARE");
+  const uint32_t extent = GuestBaseExtentBytes(desc);
+  const uint32_t source_address = desc.base_address ? desc.base_address : desc.mip_address;
+  const bool exact_compare = compare_textures && extent &&
+                            (source_address & 0x1FFFFFFF) + extent <= 0x20000000u;
+  // Compare precisely the bytes covered by the original validator: whole small
+  // textures, the same 64 x 512-byte spans for large textures. No hash collisions,
+  // no reduced coverage or delayed invalidation. Snapshots are evicted with the SRV.
+  const uint32_t validation_size = extent <= 256 * 1024 ? extent : 64 * 512;
+  auto same_texture_bytes = [&](const std::vector<uint8_t>& previous) {
+    if (previous.size() != validation_size) return false;
+    if (extent <= 256 * 1024)
+      return std::memcmp(previous.data(), Physical(source_address), extent) == 0;
+    for (uint32_t i = 0; i < 64; ++i) {
+      uint32_t off = uint32_t(uint64_t(extent - 512) * i / 63);
+      if (std::memcmp(previous.data() + i * 512, Physical(source_address + off), 512)) return false;
+    }
+    return true;
+  };
   auto sample_hash = [&]() {
     uint32_t extent = GuestBaseExtentBytes(desc);
     uint32_t addr = desc.base_address ? desc.base_address : desc.mip_address;
@@ -880,10 +918,27 @@ ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], Text
     return h;
   };
   if (slot && slot->validated_frame != frame_) {
-    uint64_t h = sample_hash();
-    if (h != slot->sample_hash) slot.reset();
+    bool changed = exact_compare
+      ? !same_texture_bytes(slot->validation_bytes)
+      : sample_hash() != slot->sample_hash;
+    if (changed) slot.reset();
     else slot->validated_frame = frame_;
+    texture_reloaded_ = changed;
+  } else {
+    texture_reloaded_ = false;
   }
+  const auto load_start = std::chrono::steady_clock::now();
+  struct SlowLoadLog {
+    RendererImpl* self; const TextureDesc& desc; std::chrono::steady_clock::time_point start; bool armed = false;
+    ~SlowLoadLog() {
+      if (!armed || !RenderProfile::Get().enabled) return;
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (ms > 1)
+        REXLOG_INFO("street4 slow texture load #{} {:.2f} ms: addr={:08X} fmt={} {}x{}x{} dim={} reloaded={}",
+                    self->frame_, ms, desc.base_address, desc.format, desc.width, desc.height, desc.depth,
+                    desc.dimension, self->texture_reloaded_);
+    }
+  } slow_load{this, desc, load_start, !slot};
   auto trace_null = [&](const char* why) {
     if (TraceFrame(frame_))
       REXLOG_INFO("trace texture null ({}): addr={:08X} fmt={} {}x{}x{} dim={} req_dim={} tiled={} packed={}", why,
@@ -955,7 +1010,15 @@ ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], Text
       if (SUCCEEDED(device_->CreateTexture3D(&vd, &vi, t->volume.put())))
         device_->CreateShaderResourceView(t->volume.get(), nullptr, t->srv_volume.put());
     }
-    t->sample_hash = sample_hash();
+    if (exact_compare) {
+      t->validation_bytes.resize(validation_size);
+      if (extent <= 256 * 1024)
+        std::memcpy(t->validation_bytes.data(), Physical(source_address), extent);
+      else for (uint32_t i = 0; i < 64; ++i) {
+        uint32_t off = uint32_t(uint64_t(extent - 512) * i / 63);
+        std::memcpy(t->validation_bytes.data() + i * 512, Physical(source_address + off), 512);
+      }
+    } else t->sample_hash = sample_hash();
     t->validated_frame = frame_;
     slot = std::move(t);
   }
@@ -1068,6 +1131,7 @@ void RendererImpl::UpdateDynamicBuffer(Com<ID3D11Buffer>& buffer, uint32_t& capa
 
 ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint32_t bytes,
                                                         bool cacheable, const uint8_t* host) {
+  RenderPhase profile(RenderProfile::Vertex);
   bytes = std::min<uint32_t>((bytes + 15) & ~15u, 64u << 20);
   if (!bytes) bytes = 16;
   auto fill = [&](VertexBufferEntry& e) {
@@ -1095,10 +1159,19 @@ ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint3
   auto& e = *slot;
   e.last_used = frame_;
   if (e.validated_frame == frame_ && e.srv) return e.srv.get();
-  uint64_t h = Hash64(host, bytes);
-  if (!e.srv || h != e.hash) {
-    fill(e);
-    e.hash = h;
+  static const bool compare_vertices = !std::getenv("STREET4_NO_VERTEX_COMPARE");
+  if (compare_vertices && bytes <= 1024 * 1024) {
+    if (!e.srv || e.validation_bytes.size() != bytes ||
+        std::memcmp(e.validation_bytes.data(), host, bytes) != 0) {
+      fill(e);
+      e.validation_bytes.assign(host, host + bytes);
+    }
+  } else {
+    uint64_t h = Hash64(host, bytes);
+    if (!e.srv || h != e.hash) {
+      fill(e);
+      e.hash = h;
+    }
   }
   e.validated_frame = frame_;
   return e.srv.get();
@@ -1108,10 +1181,25 @@ ID3D11ShaderResourceView* RendererImpl::GetVertexBuffer(uint32_t physical, uint3
 bool RendererImpl::BuildIndices(const DrawRequest& draw, D3D11_PRIMITIVE_TOPOLOGY& topology,
                                 std::vector<uint32_t>& out, bool& use_indices, bool& rect_list,
                                 const GuestDevice& dev) {
+  RenderPhase profile(RenderProfile::Indices);
   out.clear();
   rect_list = false;
   uint32_t n = draw.count;
   if (!n) return false;
+  static const bool direct_draw = !std::getenv("STREET4_NO_DIRECT_DRAW");
+  if (direct_draw && !draw.indexed) {
+    switch (draw.primitive) {
+      case 1: topology = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; break;
+      case 2: topology = D3D11_PRIMITIVE_TOPOLOGY_LINELIST; break;
+      case 3: topology = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; break;
+      case 4: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST; break;
+      case 6: topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP; break;
+      default: goto converted_indices;
+    }
+    use_indices = false;
+    return true;
+  }
+converted_indices:
   std::vector<uint32_t>& src = index_scratch_;
   src.resize(n);
   bool reset_enabled = (dev.reg(0x2205) >> 21) & 1;  // PA_SU_SC_MODE_CNTL.multi_prim_ib_ena
@@ -1274,6 +1362,7 @@ void RendererImpl::SetupStates(const GuestDevice& dev, uint32_t color_mask_activ
 
 // --------------------------------------------------------------------------- draw
 void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
+  RenderPhase profile(RenderProfile::Draw);
   if (!EnsureDevice()) return;
   ++frame_draws_;
   if (tiling_) ++frame_tiled_draws_;
@@ -1373,9 +1462,11 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
                   draw.indexed, draw.index_address, draw.index32);
     return;
   }
-  UpdateDynamicBuffer(index_buffer_, index_capacity_, D3D11_BIND_INDEX_BUFFER, indices.data(),
-                      uint32_t(indices.size() * 4));
-  context_->IASetIndexBuffer(index_buffer_.get(), DXGI_FORMAT_R32_UINT, 0);
+  if (use_indices) {
+    UpdateDynamicBuffer(index_buffer_, index_capacity_, D3D11_BIND_INDEX_BUFFER, indices.data(),
+                        uint32_t(indices.size() * 4));
+    context_->IASetIndexBuffer(index_buffer_.get(), DXGI_FORMAT_R32_UINT, 0);
+  }
   context_->IASetPrimitiveTopology(topology);
   context_->IASetInputLayout(nullptr);
 
@@ -1495,15 +1586,29 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   };
   apply_literals(dev.u32(dev::kVertexShader), 0x368, 0x20);
   apply_literals(dev.u32(dev::kPixelShader), 0x28, 0x18);
-  auto upload_consts = [&](ID3D11Buffer* cb, const uint32_t* src) {
+  if (trace && ps) {
+    REXLOG_INFO("street4 fx pass: {} c0=({:g},{:g},{:g},{:g}) c1=({:g},{:g},{:g},{:g})", ps->name,
+      AsFloat(alu[1024]), AsFloat(alu[1025]), AsFloat(alu[1026]), AsFloat(alu[1027]),
+      AsFloat(alu[1028]), AsFloat(alu[1029]), AsFloat(alu[1030]), AsFloat(alu[1031]));
+  }
+  if (ps && !ea_postfx::Enabled(ps->effect_pass)) {
+    ea_postfx::Neutralize(ps->effect_pass, alu.data() + 1024);
+    if (trace) REXLOG_INFO("street4 fx neutralized: {}", ps->name);
+  }
+  static const bool cache_constants = !std::getenv("STREET4_NO_CONSTANT_CACHE");
+  auto upload_consts = [&](ID3D11Buffer* cb, const uint32_t* src,
+                           std::array<uint32_t, 1024>& previous, bool& valid) {
+    if (cache_constants && valid && std::memcmp(previous.data(), src, 4096) == 0) return;
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(context_->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
       std::memcpy(m.pData, src, 1024 * 4);
       context_->Unmap(cb, 0);
+      std::memcpy(previous.data(), src, 4096);
+      valid = true;
     }
   };
-  upload_consts(cb_vs_.get(), alu.data());
-  upload_consts(cb_ps_.get(), alu.data() + 1024);
+  upload_consts(cb_vs_.get(), alu.data(), last_vs_constants_, vs_constants_valid_);
+  upload_consts(cb_ps_.get(), alu.data() + 1024, last_ps_constants_, ps_constants_valid_);
   {
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(context_->Map(cb_sys_.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -1574,7 +1679,8 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   D3D11_RECT host_scissor = ScaledRect(scissor.left, scissor.top, scissor.right, scissor.bottom, rt_scale);
   context_->RSSetScissorRects(1, &host_scissor);
 
-  if (std::getenv("STREET4_DUMP_DRAW") && ps) {
+  static const bool dump_draw = std::getenv("STREET4_DUMP_DRAW") != nullptr;
+  if (dump_draw && ps) {
     static std::string dumped;
     char ps_name[32];
     snprintf(ps_name, sizeof(ps_name), "%p", static_cast<void*>(ps));
@@ -1605,7 +1711,8 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
     device_->CreateQuery(&qd, samples_query.put());
     if (samples_query) context_->Begin(samples_query.get());
   }
-  context_->DrawIndexed(UINT(indices.size()), 0, 0);
+  if (use_indices) context_->DrawIndexed(UINT(indices.size()), 0, 0);
+  else context_->Draw(draw.count, draw.first_vertex);
   if (samples_query) {
     context_->End(samples_query.get());
     UINT64 passed = 0;
@@ -1663,7 +1770,7 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
         for (int i = 252; i < 256; ++i)
           c += fmt::format(" c{}=({:g},{:g},{:g},{:g})", i, AsFloat(alu[1024 + i * 4]), AsFloat(alu[1024 + i * 4 + 1]),
                            AsFloat(alu[1024 + i * 4 + 2]), AsFloat(alu[1024 + i * 4 + 3]));
-        REXLOG_INFO("trace psconst draw-{:02}:{}", int(seen.size()), c);
+        REXLOG_INFO("trace psconst draw-{:02}:{}", n, c);
         // Host-endian VS c0-c255 followed by PS c0-c255, including shader literals.
         // In particular this preserves the CPU-generated crowd lighting for A/B checks.
         std::ofstream(fmt::format("{}/draw-{:02}-constants.bin", dump_dir, n), std::ios::binary)
@@ -1855,7 +1962,15 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     hist.last_frame = frame_;
   }
   const bool steady = hist.streak >= 4;
-  const bool throttled = steady && hist.queued_frame != frame_ && frame_ - hist.queued_frame < 60;
+  // Each destination has its own slot in the once-a-second cycle: storing all the full-screen
+  // chains in the same frame took 6-10 ms of that frame (~2 ms each). A 4-frame window catches
+  // targets resolved every other frame. STREET4_NO_WRITEBACK_STAGGER=1 restores one shared slot.
+  static const bool no_stagger = std::getenv("STREET4_NO_WRITEBACK_STAGGER") != nullptr;
+  const uint32_t phase = no_stagger ? 0 : (((dest_base & 0x1FFFFFFF) >> 12) * 2654435761u) >> 26;
+  const bool due = no_stagger ? frame_ - hist.queued_frame >= 60
+                              : ((frame_ + phase) % 60 < 4 && frame_ - hist.queued_frame >= 4) ||
+                                    frame_ - hist.queued_frame >= 120;
+  const bool throttled = steady && hist.queued_frame != frame_ && !due;
   if (!throttled) hist.queued_frame = frame_;
   Com<ID3D11Texture2D> staging;
   for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
@@ -1881,6 +1996,7 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
 }
 
 void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
+  RenderPhase profile(RenderProfile::WriteBack);
   uint8_t* mem = const_cast<uint8_t*>(Physical(0));
   // Cost accounting, logged every 600 frames.
   static uint64_t stat_ns = 0, stat_bytes = 0, stat_stored = 0, stat_skipped = 0, stat_forced = 0,
@@ -1906,6 +2022,23 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
   for (size_t i = 0; i < writebacks_.size();) {
     const PendingWriteBack& f = writebacks_[i];
     if (all ? int32_t(f.fence - fence) > 0 : f.frame >= frame_) break;
+    // At the frame-late drain nobody waits for these results: when the GPU has not finished the
+    // copy yet, leave them for a later frame instead of stalling on Map (a ~6 ms hitch once per
+    // second with the steady copies). Fence waits (all) still block, the CPU reads after them.
+    // The same for the once-a-second copy of a steady destination at a fence wait for an earlier
+    // frame (frame pacing): only results of the current frame are what such a wait is for.
+    static const bool no_async = std::getenv("STREET4_NO_ASYNC_WRITEBACK") != nullptr;
+    const bool deferrable = all ? f.steady && f.frame < frame_ : true;
+    if (!no_async && deferrable && frame_ - f.frame < 4) {
+      D3D11_MAPPED_SUBRESOURCE probe;
+      if (context_->Map(f.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &probe) ==
+          DXGI_ERROR_WAS_STILL_DRAWING) {
+        if (!all) break;
+        ++i;
+        continue;
+      }
+      context_->Unmap(f.staging.get(), 0);
+    }
     PendingWriteBack p = std::move(writebacks_[i]);
     writebacks_.erase(writebacks_.begin() + i);
     // Results the GPU overwrites every frame (post-processing chains, the scene) are already
@@ -1926,6 +2059,19 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
     // (frame pacing, in every frame) do not store the scene and post-processing chains again.
     bool store = (all ? !p.throttled || p.frame == frame_ : !p.throttled) &&
                  (!superseded || frame_ - last_stored >= 8);
+    // A later resolve of the same frame covering this rectangle, completed before this same wait
+    // (or drain), is stored right after it: nothing can read this one in between.
+    static const bool no_dedupe = std::getenv("STREET4_NO_WRITEBACK_DEDUPE") != nullptr;
+    if (store && !no_dedupe)
+      for (size_t k = i; k < writebacks_.size(); ++k) {
+        const auto& q = writebacks_[k];
+        if (all ? int32_t(q.fence - fence) > 0 : q.frame >= frame_) break;
+        if (q.frame == p.frame && q.dest_base == p.dest_base && q.x <= p.x && q.y <= p.y &&
+            q.x + q.w >= p.x + p.w && q.y + q.h >= p.y + p.h && q.throttled == p.throttled) {
+          store = false;
+          break;
+        }
+      }
     // Diagnostics: a stored result overlapping vertex data drawn in the last frames.
     static const bool vb_check = std::getenv("STREET4_WB_VBCHECK") != nullptr;
     if (vb_check && store) {
@@ -1953,7 +2099,10 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
     if (all) ++stat_forced;
     if (store) stat_bytes += uint64_t(p.w) * p.h * p.bpp;
     D3D11_MAPPED_SUBRESOURCE m;
-    if (store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+    auto map_start = std::chrono::steady_clock::now();
+    bool mapped = store && SUCCEEDED(context_->Map(p.staging.get(), 0, D3D11_MAP_READ, 0, &m));
+    double map_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+    if (mapped) {
       // Diagnostics: STREET4_DUMP_WB=<w>x<h>[,...] writes the first stored results of those sizes (host
       // texel order, color and alpha) as BMPs to STREET4_WB_DIR.
       // STREET4_WB_LOG=1: per-byte averages of small stored results (A/B comparisons).
@@ -2009,8 +2158,20 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
         for (int32_t col = 0; col < p.w;) {
           int32_t px = p.x + col;
           int32_t n = std::min(run - (px & (run - 1)), p.w - col);
-          uint32_t off = p.dest_base + uint32_t(TiledOffset2D(px, py, pitch, log2_bpp));
+          uint32_t off = p.dest_base + uint32_t(TiledOffset2DInline(px, py, pitch, log2_bpp));
           uint32_t bytes = uint32_t(n) * p.bpp;
+          // Common case (whole 16-byte run of 32-bit texels): no per-byte loop.
+          if (bytes == 16 && p.bpp == 4 && !p.pack4444 && off + 16 <= 0x20000000u &&
+              (p.endian == 0 || p.endian == 2)) {
+            const uint8_t* src = src_row + size_t(col) * 4;
+            uint32_t v[4];
+            std::memcpy(v, src, 16);
+            if (p.endian == 2)
+              for (uint32_t& x : v) x = _byteswap_ulong(x);
+            std::memcpy(mem + off, v, 16);
+            col += n;
+            continue;
+          }
           if (off + bytes <= 0x20000000u) {
             const uint8_t* src = src_row + size_t(col) * (p.pack4444 ? 4 : p.bpp);
             uint8_t packed[16];
@@ -2052,6 +2213,12 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
         }
       }
       context_->Unmap(p.staging.get(), 0);
+    }
+    if (RenderProfile::Get().enabled && store) {
+      double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - map_start).count();
+      if (ms > 1)
+        REXLOG_INFO("street4 slow write-back #{} {:.2f} ms (map {:.2f}): {:08X} {}x{} bpp={} endian={} steady={} throttled={} age={} all={}",
+                    frame_, ms, map_ms, p.dest_base, p.w, p.h, p.bpp, p.endian, p.steady, p.throttled, frame_ - p.frame, all);
     }
     if (store) {
       // Later results for the same destination compare against what was just stored.
@@ -2161,6 +2328,7 @@ uint32_t RendererImpl::ReadPixel(ID3D11Texture2D* texture, uint32_t x, uint32_t 
 
 // --------------------------------------------------------------------------- resolve
 void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
+  RenderPhase profile(RenderProfile::Resolve);
   if (!EnsureDevice()) return;
   uint32_t copy_control = dev.reg(0x2318);
   // Source: D3DRESOLVE_RENDERTARGET0-3 / DEPTHSTENCIL (4) in the low bits of the flags; the
@@ -2354,6 +2522,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
 
 // --------------------------------------------------------------------------- present
 void RendererImpl::Present(const uint8_t* fetch) {
+  RenderPhase profile(RenderProfile::Present);
   auto enter = std::chrono::steady_clock::now();
   if (!EnsureDevice()) return;
   struct SlowLog {
@@ -2391,7 +2560,10 @@ void RendererImpl::Present(const uint8_t* fetch) {
   static const char* shot_dir = std::getenv("STREET4_SHOT_DIR");
   static const int shot_every = std::getenv("STREET4_SHOT_EVERY") ? std::atoi(std::getenv("STREET4_SHOT_EVERY")) : 0;
   bool take_shot = src && shot_dir && shot_every > 0 && frame_ > 0 && (frame_ % shot_every) == 0;
-  if (src && ((frame_ % 120) == 0 || take_shot)) {
+  // Diagnostics only: reading the front buffer back stalls the GPU (it caused a ~20 ms hitch
+  // every 120 frames), so the periodic average needs STREET4_FRONT_AVG=1.
+  static const bool front_avg = std::getenv("STREET4_FRONT_AVG") != nullptr;
+  if (src && ((front_avg && (frame_ % 120) == 0) || take_shot)) {
     // Diagnostics: average color of the guest front buffer.
     Com<ID3D11Resource> res;
     src->GetResource(res.put());
@@ -2467,16 +2639,24 @@ void RendererImpl::Present(const uint8_t* fetch) {
                  *h = bb_height_;
                  return true;
                });
+  // A new internal resolution from the settings menu takes effect from the next frame: targets
+  // and resolve destinations of another scale are recreated as they are used.
+  if (float s = pcs::ResolutionScale(); s != scale_) {
+    REXLOG_INFO("street4 renderer: internal resolution x{:.3f} -> x{:.3f}", scale_, s);
+    scale_ = s;
+  }
   auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - present_start).count();
   static int slow_logs = 0;
   if (present_ms > 100 && !pcs::MenuOpen() && slow_logs++ < 20)
     REXLOG_WARN("street4 present #{}: present took {} ms", frame_, present_ms);
-  if (std::getenv("STREET4_FRAME_STATS") && (frame_ % 30) < 4)
+  static const bool frame_stats = std::getenv("STREET4_FRAME_STATS") != nullptr;
+  if (frame_stats && (frame_ % 30) < 4)
     REXLOG_INFO("street4 frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
                 frame_tiled_draws_, frame_tilings_);
   frame_draws_ = frame_tiled_draws_ = frame_tilings_ = 0;
   DrainWriteBacks(false);
+  RenderProfile::Get().Frame();
   ++frame_;
   transient_next_ = 0;
   // Drop resources unused for a while.
