@@ -18,6 +18,7 @@ inline pcs::GameInfo PcGameInfo() {
   info.languages = kLanguages;
   info.language_count = int(sizeof(kLanguages) / sizeof(kLanguages[0]));
   info.internal_resolution = true;
+  info.msaa = true;
   static const pcs::Effect kEffects[] = {
       {"vignette", L"Vinheta", L"Vignette",
        L"Escurecimento das bordas da imagem.", L"Darkening around the edges of the image."},
