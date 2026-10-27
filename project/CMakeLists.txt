@@ -14,6 +14,8 @@ include(generated/rexglue.cmake)
 set(FIFASTREET4_SOURCES
     src/main.cpp
     src/pc_settings.cpp
+    src/pc_theme.cpp
+    src/pc_font.cpp
 )
 
 if(WIN32)
@@ -38,6 +40,8 @@ if(TARGET fifastreet4_fifadllzf_xex)
         src/native/native_audio.cpp
         src/native/game_log.cpp
         src/pc_settings.cpp
+        src/pc_theme.cpp
+        src/pc_font.cpp
     )
     target_include_directories(fifastreet4_fifadllzf_xex PRIVATE src src/native)
     # XMA decoding with the SDK's prebuilt libavcodec (Xenia FFmpeg fork); headers from
