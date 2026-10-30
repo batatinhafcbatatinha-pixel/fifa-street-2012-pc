@@ -39,6 +39,7 @@ if(TARGET fifastreet4_fifadllzf_xex)
         src/native/texture_loader.cpp
         src/native/native_audio.cpp
         src/native/game_log.cpp
+        src/native/game_natives.cpp
         src/pc_settings.cpp
         src/pc_theme.cpp
         src/pc_font.cpp
