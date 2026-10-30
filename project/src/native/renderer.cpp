@@ -1,11 +1,16 @@
+#include "../platform/native_byteorder.h"
+#include "../platform/native_host_window.h"
 // FIFA Street 4 native renderer (Direct3D 11). See renderer.h.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#ifndef _WIN32
+#include "../platform/native_win32_posix.h"
+#endif
 
 #include <d3d11_1.h>
-#include <d3dcompiler.h>
+#include "../platform/native_shader_compiler.h"
 #include <dxgi1_2.h>
 
 #include <algorithm>
@@ -541,7 +546,7 @@ bool RendererImpl::EnsureDevice() {
   membase_ = runtime->memory()->virtual_membase();
   physbase_ = runtime->memory()->physical_membase();
   if (auto* window = runtime->display_window())
-    hwnd_ = static_cast<HWND>(window->GetNativeWindowHandle());
+    hwnd_ = static_cast<HWND>(native_host::WindowHandle(window));
   if (!hwnd_) return false;
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -560,8 +565,12 @@ bool RendererImpl::EnsureDevice() {
   UpdateMsaa();
   context_->QueryInterface(__uuidof(ID3D11DeviceContext1),
                            reinterpret_cast<void**>(context1_.put()));
+#ifdef _WIN32
   HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
   if (compiler) compile_ = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
+#else
+  compile_ = &D3DCompile;
+#endif
   if (!compile_) {
     REXLOG_ERROR("street4 renderer: d3dcompiler_47.dll not available");
     device_failed_ = true;
@@ -571,6 +580,9 @@ bool RendererImpl::EnsureDevice() {
                                              : runtime->cache_root();
   cache_dir_ /= "street4_shaders";
   std::error_code ec;
+#ifndef _WIN32
+  cache_dir_ /= "vkd3d";
+#endif
   std::filesystem::create_directories(cache_dir_, ec);
 
   auto make_cb = [&](Com<ID3D11Buffer>& b, UINT size) {
@@ -2232,7 +2244,7 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
             uint32_t v[4];
             std::memcpy(v, src, 16);
             if (p.endian == 2)
-              for (uint32_t& x : v) x = _byteswap_ulong(x);
+              for (uint32_t& x : v) x = native_host::ByteSwap32(x);
             std::memcpy(mem + off, v, 16);
             col += n;
             continue;
@@ -2262,7 +2274,7 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
               for (uint32_t i = 0; i < bytes; i += 4) {
                 uint32_t v;
                 std::memcpy(&v, src + i, 4);
-                v = _byteswap_ulong(v);
+                v = native_host::ByteSwap32(v);
                 std::memcpy(dst + i, &v, 4);
               }
             } else {  // 16in32
