@@ -198,7 +198,7 @@ void SamplePose(PPCContext& ctx, uint8_t* base) {
   const uint32_t parents = Load32(base, skeleton + 28);
   const uint32_t out_index = Load32(base, skeleton + 32);
   if (bind_pose) {  // memcpy(out, bind pose, matrices * 64)
-    uint64_t saved_sp = ctx.r1.u64;
+    uint64_t saved_sp = ctx.r1.u64, saved_lr = ctx.lr;
     ctx.r1.u64 = uint32_t(sp - 320);
     ctx.r3.u64 = out;
     ctx.r4.u64 = bind_pose;
@@ -206,6 +206,7 @@ void SamplePose(PPCContext& ctx, uint8_t* base) {
     ctx.lr = 0x82AA61EC;
     sub_82738530(ctx, base);
     ctx.r1.u64 = saved_sp;
+    ctx.lr = saved_lr;  // restored by the epilogue
   }
 
   ctx.fpscr.disableFlushMode();
