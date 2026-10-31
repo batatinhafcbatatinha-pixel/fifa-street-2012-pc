@@ -17,7 +17,7 @@ An experimental port of the Xbox 360 FIFA Street (2012, sometimes called "FIFA S
 - Audio: XMA contexts live in guest memory and are decoded with FFmpeg's XMA decoder; `XAudio` render-driver frames go to XAudio2 with a 5.1 → stereo downmix. No audio hardware model.
 - The Xbox 360 kernel and XAM services come from the ReXGlue runtime as an operating-system compatibility layer.
 - Other known issues: crashes may remain. DLC is not supported.
-- Windows x64 only.
+- Tested on Windows x64; a Linux build path exists. Experimental [macOS](MACOS.md) build files are included; they have not been compiled or run yet.
 
 ## Why a native port instead of an emulator
 
@@ -73,6 +73,10 @@ python3 tools/play.py --game-files game_files
 ```
 
 The build copies the SDK runtime, DXVK native and vkd3d-shader next to the executable (it finds them there).
+
+## Build on macOS
+
+Experimental and not compiled or run yet: see [MACOS.md](MACOS.md).
 
 ## Keyboard controls
 
