@@ -71,6 +71,7 @@ class Fifastreet4App : public rex::ReXApp {
         -> std::unique_ptr<rex::system::IAudioSystem> {
       return std::make_unique<street4::NativeAudioSystem>();
     };
+    pcs::InstallPadTap(config);
   }
 
   // The launcher loads the game module as "fifadllzf.xex.dll"; the kernel resolves it
