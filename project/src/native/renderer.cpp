@@ -38,6 +38,9 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/window.h>
+#ifndef _WIN32
+#include <rex/exception_handler.h>
+#endif
 
 #include "renderer.h"
 #include "render_profile.h"
@@ -325,7 +328,10 @@ struct RenderTarget {
   Com<ID3D11RenderTargetView> rtv;
   Com<ID3D11DepthStencilView> dsv;
   Com<ID3D11ShaderResourceView> srv;
-  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv).
+  // MSAA: single-sample copy for resolves (RendererImpl::SingleSampleSrv), current unless the
+  // target was drawn to or cleared since (tiled frames resolve the same surface several times).
+  bool single_stale = true;
+  uint64_t single_epoch = 0;
   Com<ID3D11Texture2D> single;
   Com<ID3D11ShaderResourceView> single_srv;
   Com<ID3D11RenderTargetView> single_rtv;
@@ -386,6 +392,14 @@ struct VertexBufferEntry {
   WriteWatchState watch;
 };
 
+// The D3D11 immediate context is single-threaded; CPU waits (FlushWriteBacks) can come from
+// threads other than the one issuing the draws.
+static std::recursive_mutex& ApiMutex() {
+  static std::recursive_mutex m;
+  return m;
+}
+using ApiLock = std::lock_guard<std::recursive_mutex>;
+
 class RendererImpl {
  public:
   bool Ready() { return EnsureDevice(); }
@@ -405,9 +419,30 @@ class RendererImpl {
   // Stores queued resolve results in guest memory: those issued before `fence` (`all`, when the
   // CPU waits for that fence), or those of earlier frames (at present, when the GPU is done).
   void DrainWriteBacks(bool all, uint32_t fence = 0);
+  // pack4444: host RGBA8 texels stored as 4_4_4_4 (bpp 2).
+  void StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t dest_base, uint32_t dest_pitch, uint32_t endian,
+                  uint32_t bpp, int32_t x, int32_t y, int32_t w, int32_t h, bool pack4444 = false);
   ID3D11Texture2D* GuestSizeCopy(const ResolvedTexture& r, uint32_t key, int32_t x, int32_t y, int32_t w,
                                  int32_t h);
+  // Tiled frames are drawn once for the union of the tiles, but each tile's resolve clears its
+  // own rectangle. D3D11 clears depth only whole, so a tile's depth clear waits until the tiles
+  // cleared cover the surface (or tiling ends); clearing at once would erase the depth the next
+  // tile still resolves.
+  struct TileDepthClear {
+    Com<ID3D11DepthStencilView> dsv;
+    float z = 0;
+    uint8_t stencil = 0;
+    uint64_t area = 0;
+  } tile_depth_clear_;
+  void FlushTileDepthClear() {
+    if (tile_depth_clear_.dsv) ++tile_depth_clear_epoch_;
+    if (tile_depth_clear_.dsv)
+      context_->ClearDepthStencilView(tile_depth_clear_.dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
+                                      tile_depth_clear_.z, tile_depth_clear_.stencil);
+    tile_depth_clear_ = {};
+  }
   void SetTiling(bool active, uint32_t width, uint32_t height) {
+    if (!active) FlushTileDepthClear();
     if (active) Trace().OnTiling(frame_);
     if (active) ++frame_tilings_;
     tiling_ = active && width && height;
@@ -449,6 +484,7 @@ class RendererImpl {
   // single-sample copy (SingleSampleSrv).
   uint32_t msaa_ = 1, msaa_wanted_ = 0, bound_samples_ = 1;
   uint32_t SamplesFor(uint32_t width) const { return width >= 640 ? msaa_ : 1; }
+  uint64_t single_copied_ = 0, single_reused_ = 0, tile_depth_clear_epoch_ = 0;
   void UpdateMsaa() {
     uint32_t want = uint32_t(pcs::MsaaSamples());
     if (want == msaa_wanted_) return;
@@ -547,6 +583,40 @@ class RendererImpl {
   std::unordered_map<uint32_t, uint32_t> writebacks_by_address_;
   std::unordered_map<uint32_t, uint64_t> writeback_last_stored_;  // address -> frame
   std::unordered_map<uint32_t, WriteBackHistory> writeback_history_;
+  // Steady destinations whose results the CPU has not read yet (see QueueWriteBack): the whole
+  // guest pages they cover stay inaccessible in the CPU views until the CPU touches them, and
+  // that access stores the latest resolve first (HandleOnDemandFault).
+  struct OnDemandWriteBack {
+    Com<ID3D11Texture2D> texture;  // the resolve destination, at internal resolution
+    Com<ID3D11ShaderResourceView> srv;
+    uint32_t width = 0, height = 0;
+    float scale = 1.0f;
+    uint32_t dest_base = 0, dest_pitch = 0, endian = 0, bpp = 0;
+    bool pack4444 = false;
+    int32_t x = 0, y = 0, w = 0, h = 0;
+    uint32_t first_page = 0, end_page = 0;  // physical, whole pages inside the destination
+    bool dirty = false, protected_pages = false;
+    bool cpu_polled = false;  // read by the CPU nearly every frame: periodic copies instead
+    bool reads_value = true;  // those reads fetched a value from inside, not the image from its start
+    uint64_t polled_frame = 0;
+    uint64_t last_fault_frame = 0;
+    uint32_t close_faults = 0;
+    uint64_t last_resolve_frame = 0;
+    uint64_t stored_hash = 0;  // guest sample hash right after the last on-demand store
+    bool has_stored_hash = false;
+  };
+  std::recursive_mutex ondemand_mutex_;
+  std::unordered_map<uint32_t, OnDemandWriteBack> ondemand_;
+  bool ProtectOnDemand(const OnDemandWriteBack& od, DWORD protect);
+  void StoreOnDemand(OnDemandWriteBack& od);
+  void ExpireOnDemand();
+  bool OnDemandStored(uint32_t base, uint64_t guest_hash);
+  bool OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address, uint32_t* offset = nullptr);
+
+ public:
+  bool HandleOnDemandFault(uintptr_t host_address);
+
+ private:
   std::vector<Com<ID3D11Texture2D>> staging_pool_;
   std::unordered_map<uint64_t, std::unique_ptr<VertexBufferEntry>> vertex_buffers_;
   std::unordered_map<uint64_t, std::unique_ptr<IndexBufferEntry>> index_buffers_;
@@ -579,6 +649,24 @@ class RendererImpl {
 };
 
 // --------------------------------------------------------------------------- device
+RendererImpl* g_ondemand_owner = nullptr;
+
+#ifdef _WIN32
+LONG CALLBACK OnDemandFaultHandler(EXCEPTION_POINTERS* e) {
+  if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || !g_ondemand_owner)
+    return EXCEPTION_CONTINUE_SEARCH;
+  return g_ondemand_owner->HandleOnDemandFault(uintptr_t(e->ExceptionRecord->ExceptionInformation[1]))
+             ? EXCEPTION_CONTINUE_EXECUTION
+             : EXCEPTION_CONTINUE_SEARCH;
+}
+#else
+// Linux: the SDK's host exception handler (SIGSEGV) reports the faulting address the same way.
+bool OnDemandFaultLinux(rex::arch::Exception* ex, void*) {
+  if (ex->code() != rex::arch::Exception::Code::kAccessViolation || !g_ondemand_owner) return false;
+  return g_ondemand_owner->HandleOnDemandFault(uintptr_t(ex->fault_address()));
+}
+#endif
+
 bool RendererImpl::EnsureDevice() {
   if (device_) return EnsureSwapChain();
   if (device_failed_) return false;
@@ -616,6 +704,12 @@ bool RendererImpl::EnsureDevice() {
   UpdateMsaa();
   context_->QueryInterface(__uuidof(ID3D11DeviceContext1),
                            reinterpret_cast<void**>(context1_.put()));
+  g_ondemand_owner = this;
+#ifdef _WIN32
+  AddVectoredExceptionHandler(1, OnDemandFaultHandler);
+#else
+  rex::arch::ExceptionHandler::Install(OnDemandFaultLinux, nullptr);
+#endif
 #ifdef _WIN32
   HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
   if (compiler) compile_ = reinterpret_cast<D3DCompileFn>(GetProcAddress(compiler, "D3DCompile"));
@@ -972,6 +1066,8 @@ ID3D11ShaderResourceView* RendererImpl::GetTexture(const uint32_t fetch[6], Text
       uint64_t h = writebacks_by_address_.count(desc.base_address & 0x1FFFFFFF)
                        ? r->guest_hash
                        : Hash64(Physical(desc.base_address), sample);
+      if (h != r->guest_hash && sample == 4096 && OnDemandStored(desc.base_address & 0x1FFFFFFF, h))
+        r->guest_hash = h;
       if (h == r->guest_hash && (dim == TextureDimension::k2D || dim == TextureDimension::k1D))
         return r->srv.get();
       if (h != r->guest_hash) resolved_.erase(desc.base_address);
@@ -1652,8 +1748,12 @@ void RendererImpl::Draw(const GuestDevice& dev, const DrawRequest& draw) {
   context_->PSSetShaderResources(0, 32, null_srvs);
   context_->OMSetRenderTargets(4, rtvs, dsv);
   bound_samples_ = bound_depth_ ? bound_depth_->samples : 1;
+  if (bound_depth_) bound_depth_->single_stale = true;
   for (auto* c : bound_color_)
-    if (c) bound_samples_ = c->samples;
+    if (c) {
+      bound_samples_ = c->samples;
+      c->single_stale = true;
+    }
 
   // Geometry.
   D3D11_PRIMITIVE_TOPOLOGY topology;
@@ -2095,6 +2195,14 @@ void RendererImpl::BlitTo(ID3D11RenderTargetView* rtv, uint32_t, uint32_t, D3D11
 // average of the samples (ResolveSubresource), depth sample 0 as a 32-bit float texture.
 ID3D11ShaderResourceView* RendererImpl::SingleSampleSrv(RenderTarget& rt) {
   if (rt.samples <= 1) return rt.srv.get();
+  static const bool no_reuse = std::getenv("STREET4_NO_SINGLE_REUSE") != nullptr;  // A/B
+  if (rt.single && !rt.single_stale && rt.single_epoch == tile_depth_clear_epoch_ && !no_reuse) {
+    ++single_reused_;
+    return rt.single_srv.get();
+  }
+  ++single_copied_;
+  rt.single_stale = false;
+  rt.single_epoch = tile_depth_clear_epoch_;
   D3D11_TEXTURE2D_DESC td;
   rt.texture->GetDesc(&td);
   const DXGI_FORMAT format = td.Format;
@@ -2177,13 +2285,6 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
   // 4_4_4_4 destinations are RGBA8 on the host: packed back to 16-bit texels when stored.
   const bool pack4444 = r.format == 15 && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM;
   if (pack4444) bpp = 2;
-  // Internal resolution: everything below works on a guest-size copy of the result.
-  ID3D11Texture2D* source = r.texture.get();
-  if (r.scale != 1.0f) {
-    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, std::max(x, 0), std::max(y, 0), w, h);
-    if (!source) return;
-    source->GetDesc(&td);
-  }
   x = std::max(x, 0);
   y = std::max(y, 0);
   w = std::min<int32_t>(w, int32_t(std::min<uint32_t>(td.Width, r.width)) - x);
@@ -2202,7 +2303,80 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
     hist.streak = hist.last_frame != ~0ull && frame_ - hist.last_frame <= 3 ? hist.streak + 1 : 0;
     hist.last_frame = frame_;
   }
+  static const bool no_steady_od = std::getenv("STREET4_NO_ONDEMAND") != nullptr;  // A/B
   const bool steady = hist.streak >= 4;
+  if (steady && !no_steady_od) {
+    // A steady destination can still be generated content the CPU reads once, after the last
+    // pass (lightmaps rendered over several frames at load time, then DXT-compressed): store it
+    // when the CPU actually touches it. Nothing is copied until then, not even at guest size;
+    // those copies were the biggest cost of a 4K frame.
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    uint32_t base = dest_base & 0x1FFFFFFF;
+    OnDemandWriteBack& od = ondemand_[base];
+    // Reads that started at the image were a bake in progress (a pass per frame, each result
+    // compressed by the CPU), which ends: try on-demand again.
+    if (od.cpu_polled && !od.reads_value && frame_ - od.polled_frame > 300) {
+      od.cpu_polled = false;
+      od.close_faults = 0;
+    }
+    if (!od.cpu_polled) {
+      // Tiled frames resolve one destination in several rectangles: keep their union.
+      int32_t x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+      if (od.dirty && od.texture.get() == r.texture.get()) {
+        x0 = std::min(x0, od.x);
+        y0 = std::min(y0, od.y);
+        x1 = std::max(x1, od.x + od.w);
+        y1 = std::max(y1, od.y + od.h);
+      }
+      uint32_t extent = ((dest_pitch + 31) & ~31u) * ((uint32_t(y1) + 31) & ~31u) * bpp;
+      uint32_t first = (base + 0xFFF) & ~0xFFFu, end = std::min(base + extent, 0x20000000u) & ~0xFFFu;
+      if (od.protected_pages && (od.first_page != first || od.end_page != end)) {
+        ProtectOnDemand(od, PAGE_READWRITE);
+        od.protected_pages = false;
+      }
+      if (end > first) {
+        od.texture.reset();
+        od.srv.reset();
+        r.texture.get()->AddRef();
+        od.texture.p = r.texture.get();
+        r.srv.get()->AddRef();
+        od.srv.p = r.srv.get();
+        od.width = r.width;
+        od.height = r.height;
+        od.scale = r.scale;
+        od.dest_base = base;
+        od.dest_pitch = dest_pitch;
+        od.endian = endian;
+        od.bpp = bpp;
+        od.pack4444 = pack4444;
+        od.x = x0;
+        od.y = y0;
+        od.w = x1 - x0;
+        od.h = y1 - y0;
+        od.first_page = first;
+        od.end_page = end;
+        od.dirty = true;
+        od.last_resolve_frame = frame_;
+        if (!od.protected_pages) {
+          od.protected_pages = ProtectOnDemand(od, PAGE_NOACCESS);
+          static int logs = 0;
+          if (logs++ < 40)
+            REXLOG_INFO("street4 resolve on-demand: {:08X} pages {:08X}-{:08X} protected={}", base, first, end,
+                        od.protected_pages);
+        }
+        if (od.protected_pages) return;
+      }
+    }
+  }
+  if (!steady) {
+    // The queued copy below stores this result; an older on-demand one must not replace it.
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    if (auto it = ondemand_.find(dest_base & 0x1FFFFFFF); it != ondemand_.end() && it->second.protected_pages) {
+      ProtectOnDemand(it->second, PAGE_READWRITE);
+      it->second.protected_pages = false;
+      it->second.dirty = false;
+    }
+  }
   // Each destination has its own slot in the once-a-second cycle: storing all the full-screen
   // chains in the same frame took 6-10 ms of that frame (~2 ms each). A 4-frame window catches
   // targets resolved every other frame. STREET4_NO_WRITEBACK_STAGGER=1 restores one shared slot.
@@ -2213,6 +2387,20 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
                                     frame_ - hist.queued_frame >= 120;
   const bool throttled = steady && hist.queued_frame != frame_ && !due;
   if (!throttled) hist.queued_frame = frame_;
+  // A destination the CPU reads one value from every frame (exposure) lives on the periodic copy;
+  // the copies in between would be thrown away, and they cost as much as the frame's post effects.
+  if (throttled) {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    auto it = ondemand_.find(dest_base & 0x1FFFFFFF);
+    if (it != ondemand_.end() && it->second.cpu_polled && it->second.reads_value) return;
+  }
+  // Internal resolution: everything below works on a guest-size copy of the result.
+  ID3D11Texture2D* source = r.texture.get();
+  if (r.scale != 1.0f) {
+    source = GuestSizeCopy(r, dest_base & 0x1FFFFFFF, x, y, w, h);
+    if (!source) return;
+    source->GetDesc(&td);
+  }
   Com<ID3D11Texture2D> staging;
   for (auto it = staging_pool_.begin(); it != staging_pool_.end(); ++it) {
     D3D11_TEXTURE2D_DESC sd;
@@ -2234,6 +2422,196 @@ void RendererImpl::QueueWriteBack(const ResolvedTexture& r, uint32_t dest_base, 
       {std::move(staging), dest_base & 0x1FFFFFFF, dest_pitch, endian, bpp, x, y, w, h, frame_, fence,
        steady, throttled, pack4444, MemorySnapshot(dest_base, dest_pitch, bpp, y, h)});
   ++writebacks_by_address_[dest_base & 0x1FFFFFFF];
+}
+
+// The CPU views of physical memory (64 KB, 16 MB and 4 KB pages; the last one is offset by a
+// page on hosts with 64 KB allocation granularity, see GuestPtr).
+bool RendererImpl::ProtectOnDemand(const OnDemandWriteBack& od, DWORD protect) {
+  bool any = false;
+  for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    DWORD old;
+    any |= VirtualProtect(GuestPtr(membase_, view | od.first_page), od.end_page - od.first_page, protect, &old) != 0;
+  }
+  return any;
+}
+
+// Stores the latest result of an on-demand destination now (stalls on the GPU). Called with the
+// renderer's API lock held, also from the CPU thread that touched the memory.
+void RendererImpl::StoreOnDemand(OnDemandWriteBack& od) {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  if (!od.dirty || !od.texture) return;
+  ID3D11Texture2D* source = od.texture.get();
+  if (od.scale != 1.0f) {
+    ResolvedTexture r;
+    r.width = od.width;
+    r.height = od.height;
+    r.scale = od.scale;
+    r.texture.p = od.texture.p;
+    r.srv.p = od.srv.p;
+    source = GuestSizeCopy(r, od.dest_base, od.x, od.y, od.w, od.h);
+    r.texture.p = nullptr;  // borrowed from od
+    r.srv.p = nullptr;
+    if (!source) return;
+  }
+  D3D11_TEXTURE2D_DESC td;
+  source->GetDesc(&td);
+  D3D11_TEXTURE2D_DESC sd{UINT(od.w), UINT(od.h), 1, 1, td.Format, {1, 0}, D3D11_USAGE_STAGING, 0,
+                          D3D11_CPU_ACCESS_READ, 0};
+  Com<ID3D11Texture2D> staging;
+  D3D11_MAPPED_SUBRESOURCE m;
+  if (SUCCEEDED(device_->CreateTexture2D(&sd, nullptr, staging.put()))) {
+    D3D11_BOX box{UINT(od.x), UINT(od.y), 0, UINT(od.x + od.w), UINT(od.y + od.h), 1};
+    context_->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, source, 0, &box);
+    if (SUCCEEDED(context_->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, od.dest_base, od.dest_pitch, od.endian, od.bpp,
+                 od.x, od.y, od.w, od.h, od.pack4444);
+      context_->Unmap(staging.get(), 0);
+    }
+  }
+  od.dirty = false;
+  od.stored_hash = Hash64(Physical(od.dest_base), 4096);
+  od.has_stored_hash = true;
+  static std::atomic<int> logs{0};
+  if (logs++ < 40)
+    REXLOG_INFO("street4 resolve on-demand store: {:08X} {}x{} at ({},{}) frame {}", od.dest_base, od.w, od.h, od.x,
+                od.y, frame_);
+}
+
+// Once a destination is no longer resolved its memory may be handed to something else (file
+// reads into it would fail on protected pages): its final result is stored and the pages opened.
+void RendererImpl::ExpireOnDemand() {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  for (auto& [base, od] : ondemand_) {
+    if (!od.protected_pages || frame_ - od.last_resolve_frame <= 4) continue;
+    StoreOnDemand(od);
+    ProtectOnDemand(od, PAGE_READWRITE);
+    od.protected_pages = false;
+    od.texture.reset();
+    od.srv.reset();
+  }
+}
+
+// Whether guest memory at `base` is exactly what an on-demand store left there (the host copy of
+// the resolve then stays authoritative, as after a queued write-back).
+bool RendererImpl::OnDemandStored(uint32_t base, uint64_t guest_hash) {
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  auto it = ondemand_.find(base);
+  return it != ondemand_.end() && it->second.has_stored_hash && it->second.stored_hash == guest_hash;
+}
+
+bool RendererImpl::OnDemandCovers(const OnDemandWriteBack& od, uintptr_t host_address, uint32_t* offset) {
+  if (!od.protected_pages) return false;
+  for (uint32_t view : {0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    uintptr_t first = reinterpret_cast<uintptr_t>(GuestPtr(membase_, view | od.first_page));
+    if (host_address >= first && host_address < first + (od.end_page - od.first_page)) {
+      if (offset) *offset = uint32_t(host_address - first);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool RendererImpl::HandleOnDemandFault(uintptr_t host_address) {
+  // Most faults are the memory system's own write watches: they must not wait for the renderer.
+  {
+    std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+    bool mine = false;
+    for (auto& [base, od] : ondemand_) mine |= OnDemandCovers(od, host_address);
+    if (!mine) return false;
+  }
+  // The store draws and copies with the immediate context, so it waits its turn like any API call.
+  ApiLock api(ApiMutex());
+  std::lock_guard<std::recursive_mutex> lock(ondemand_mutex_);
+  for (auto& [base, od] : ondemand_) {
+    uint32_t offset = 0;
+    if (!OnDemandCovers(od, host_address, &offset)) continue;
+    StoreOnDemand(od);  // through the physical view, before other threads see the pages open
+    ProtectOnDemand(od, PAGE_READWRITE);
+    od.protected_pages = false;
+    // A destination the CPU reads back nearly every frame (exposure, occlusion data) goes back
+    // to periodic copies: storing it on access would stall on the GPU every frame.
+    uint64_t frame = frame_;
+    od.close_faults = frame - od.last_fault_frame <= 3 ? od.close_faults + 1 : 0;
+    od.reads_value = (od.close_faults == 0 || od.reads_value) && offset != 0;
+    od.last_fault_frame = frame;
+    if (od.close_faults >= 3) {
+      od.cpu_polled = true;
+      od.polled_frame = frame;
+      od.texture.reset();
+      od.srv.reset();
+    }
+    return true;
+  }
+  return true;  // another thread stored it first
+}
+
+void RendererImpl::StoreTiled(const uint8_t* data, uint32_t row_pitch, uint32_t dest_base, uint32_t dest_pitch,
+                              uint32_t endian, uint32_t bpp, int32_t x, int32_t y, int32_t w, int32_t h,
+                              bool pack4444) {
+  uint8_t* mem = const_cast<uint8_t*>(Physical(0));
+  const uint32_t src_bpp = pack4444 ? 4 : bpp;
+  uint8_t packed[16];
+  uint32_t log2_bpp = bpp == 1 ? 0 : bpp == 2 ? 1 : bpp == 4 ? 2 : bpp == 8 ? 3 : 4;
+  uint32_t pitch = (dest_pitch + 31) & ~31u;
+  // Runs of texels that stay contiguous in the tiled layout (16 bytes, up to 8 texels).
+  const int32_t run = int32_t(std::max<uint32_t>(1, std::min<uint32_t>(8, 16u >> log2_bpp)));
+  for (int32_t row = 0; row < h; ++row) {
+    const uint8_t* src_row = data + size_t(row) * row_pitch;
+    int32_t py = y + row;
+    for (int32_t col = 0; col < w;) {
+      int32_t px = x + col;
+      int32_t n = std::min(run - (px & (run - 1)), w - col);
+      uint32_t off = dest_base + uint32_t(TiledOffset2DInline(px, py, pitch, log2_bpp));
+      uint32_t bytes = uint32_t(n) * bpp;
+      // Common case (whole 16-byte run of 32-bit texels): no per-byte loop.
+      if (bytes == 16 && bpp == 4 && !pack4444 && off + 16 <= 0x20000000u && (endian == 0 || endian == 2)) {
+        uint32_t v[4];
+        std::memcpy(v, src_row + size_t(col) * 4, 16);
+        if (endian == 2)
+          for (uint32_t& t : v) t = native_host::ByteSwap32(t);
+        std::memcpy(mem + off, v, 16);
+        col += n;
+        continue;
+      }
+      if (off + bytes <= 0x20000000u) {
+        const uint8_t* src = src_row + size_t(col) * src_bpp;
+        if (pack4444) {
+          // Channel c in bits 4c..4c+3 (as the texture loader reads 4_4_4_4).
+          for (int32_t i = 0; i < n; ++i) {
+            uint16_t v = 0;
+            for (int c = 0; c < 4; ++c) v |= uint16_t((src[i * 4 + c] * 15 + 127) / 255) << (4 * c);
+            packed[i * 2] = uint8_t(v);
+            packed[i * 2 + 1] = uint8_t(v >> 8);
+          }
+          src = packed;
+        }
+        uint8_t* dst = mem + off;
+        if (endian == 0 || bpp == 1) {
+          std::memcpy(dst, src, bytes);
+        } else if (bpp == 2 || endian == 1) {  // 8in16
+          for (uint32_t i = 0; i < bytes; i += 2) {
+            dst[i] = src[i + 1];
+            dst[i + 1] = src[i];
+          }
+        } else if (endian == 2) {  // 8in32
+          for (uint32_t i = 0; i < bytes; i += 4) {
+            uint32_t v;
+            std::memcpy(&v, src + i, 4);
+            v = native_host::ByteSwap32(v);
+            std::memcpy(dst + i, &v, 4);
+          }
+        } else {  // 16in32
+          for (uint32_t i = 0; i < bytes; i += 4) {
+            dst[i] = src[i + 2];
+            dst[i + 1] = src[i + 3];
+            dst[i + 2] = src[i];
+            dst[i + 3] = src[i + 1];
+          }
+        }
+      }
+      col += n;
+    }
+  }
 }
 
 void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
@@ -2389,70 +2767,8 @@ void RendererImpl::DrainWriteBacks(bool all, uint32_t fence) {
         ++dumped_wb;
         REXLOG_INFO("street4 write-back dump {:08X} {}x{} endian={} frame={}", p.dest_base, p.w, p.h, p.endian, frame_);
       }
-      uint32_t log2_bpp = p.bpp == 1 ? 0 : p.bpp == 2 ? 1 : p.bpp == 4 ? 2 : p.bpp == 8 ? 3 : 4;
-      uint32_t pitch = (p.dest_pitch + 31) & ~31u;
-      // Runs of texels that stay contiguous in the tiled layout (16 bytes, up to 8 texels).
-      const int32_t run = int32_t(std::max<uint32_t>(1, std::min<uint32_t>(8, 16u >> log2_bpp)));
-      for (int32_t row = 0; row < p.h; ++row) {
-        const uint8_t* src_row = static_cast<const uint8_t*>(m.pData) + size_t(row) * m.RowPitch;
-        int32_t py = p.y + row;
-        for (int32_t col = 0; col < p.w;) {
-          int32_t px = p.x + col;
-          int32_t n = std::min(run - (px & (run - 1)), p.w - col);
-          uint32_t off = p.dest_base + uint32_t(TiledOffset2DInline(px, py, pitch, log2_bpp));
-          uint32_t bytes = uint32_t(n) * p.bpp;
-          // Common case (whole 16-byte run of 32-bit texels): no per-byte loop.
-          if (bytes == 16 && p.bpp == 4 && !p.pack4444 && off + 16 <= 0x20000000u &&
-              (p.endian == 0 || p.endian == 2)) {
-            const uint8_t* src = src_row + size_t(col) * 4;
-            uint32_t v[4];
-            std::memcpy(v, src, 16);
-            if (p.endian == 2)
-              for (uint32_t& x : v) x = native_host::ByteSwap32(x);
-            std::memcpy(mem + off, v, 16);
-            col += n;
-            continue;
-          }
-          if (off + bytes <= 0x20000000u) {
-            const uint8_t* src = src_row + size_t(col) * (p.pack4444 ? 4 : p.bpp);
-            uint8_t packed[16];
-            if (p.pack4444) {
-              // Channel c in bits 4c..4c+3 (as the texture loader reads 4_4_4_4).
-              for (int32_t i = 0; i < n; ++i) {
-                uint16_t v = 0;
-                for (int c = 0; c < 4; ++c) v |= uint16_t((src[i * 4 + c] * 15 + 127) / 255) << (4 * c);
-                packed[i * 2] = uint8_t(v);
-                packed[i * 2 + 1] = uint8_t(v >> 8);
-              }
-              src = packed;
-            }
-            uint8_t* dst = mem + off;
-            if (p.endian == 0 || p.bpp == 1) {
-              std::memcpy(dst, src, bytes);
-            } else if (p.bpp == 2 || p.endian == 1) {  // 8in16
-              for (uint32_t i = 0; i < bytes; i += 2) {
-                dst[i] = src[i + 1];
-                dst[i + 1] = src[i];
-              }
-            } else if (p.endian == 2) {  // 8in32
-              for (uint32_t i = 0; i < bytes; i += 4) {
-                uint32_t v;
-                std::memcpy(&v, src + i, 4);
-                v = native_host::ByteSwap32(v);
-                std::memcpy(dst + i, &v, 4);
-              }
-            } else {  // 16in32
-              for (uint32_t i = 0; i < bytes; i += 4) {
-                dst[i] = src[i + 2];
-                dst[i + 1] = src[i + 3];
-                dst[i + 2] = src[i];
-                dst[i + 3] = src[i + 1];
-              }
-            }
-          }
-          col += n;
-        }
-      }
+      StoreTiled(static_cast<const uint8_t*>(m.pData), m.RowPitch, p.dest_base, p.dest_pitch, p.endian, p.bpp, p.x,
+                 p.y, p.w, p.h, p.pack4444);
       context_->Unmap(p.staging.get(), 0);
     }
     if (RenderProfile::Get().enabled && store) {
@@ -2703,6 +3019,7 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
     }
     D3D11_RECT r = ScaledRect(x0, y0, x1, y1, src->scale);
     context1_->ClearView(src->rtv.get(), rgba, &r, 1);
+    src->single_stale = true;
   }
   if (clear_depth) {
     uint32_t info = dev.reg(0x2002);
@@ -2713,8 +3030,23 @@ void RendererImpl::Resolve(const GuestDevice& dev, const ResolveRequest& req) {
         uint32_t f24 = dv >> 8, m = f24 & 0xFFFFF, e = f24 >> 20;
         z = e ? (1.0f + m / 1048576.0f) * std::ldexp(1.0f, int(e) - 15) : m / 1048576.0f * std::ldexp(1.0f, -14);
       }
-      context_->ClearDepthStencilView(d->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
-                                      std::clamp(z, 0.0f, 1.0f), UINT8(dv & 0xFF));
+      z = std::clamp(z, 0.0f, 1.0f);
+      uint64_t area = uint64_t(std::max(x1 - x0, 0)) * uint64_t(std::max(y1 - y0, 0));
+      static const bool no_tile_clear = std::getenv("STREET4_NO_TILE_DEPTH_CLEAR") != nullptr;  // A/B
+      if (tiling_ && !no_tile_clear && area < uint64_t(pitch) * height) {
+        if (tile_depth_clear_.dsv.get() != d->dsv.get()) FlushTileDepthClear();
+        if (!tile_depth_clear_.dsv) {
+          d->dsv->AddRef();
+          *tile_depth_clear_.dsv.put() = d->dsv.get();
+        }
+        tile_depth_clear_.z = z;
+        tile_depth_clear_.stencil = UINT8(dv & 0xFF);
+        tile_depth_clear_.area += area;
+        if (tile_depth_clear_.area >= uint64_t(pitch) * height) FlushTileDepthClear();
+      } else {
+        d->single_stale = true;
+        context_->ClearDepthStencilView(d->dsv.get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, UINT8(dv & 0xFF));
+      }
     }
   }
 }
@@ -2744,6 +3076,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
     r.clear();
     for (uint32_t k = 0; k < rect_count; ++k)
       r.push_back(ScaledRect(rects[k * 4], rects[k * 4 + 1], rects[k * 4 + 2], rects[k * 4 + 3], rt->scale));
+    rt->single_stale = true;
     if (!r.empty() && context1_)
       context1_->ClearView(rt->rtv.get(), rgba, r.data(), UINT(r.size()));
     else
@@ -2754,6 +3087,7 @@ void RendererImpl::ClearBound(const GuestDevice& dev, uint32_t color_targets,
     if (auto* d = GetRenderTarget(dev, true, info & 0xFFF, (info >> 16) & 1, pitch, height)) {
       // Depth-stencil views cannot be cleared per rectangle in D3D11; rectangles that
       // cover less than the surface are rare for depth and cleared fully.
+      d->single_stale = true;
       context_->ClearDepthStencilView(
           d->dsv.get(), (depth ? D3D11_CLEAR_DEPTH : 0) | (stencil ? D3D11_CLEAR_STENCIL : 0),
           std::clamp(z, 0.0f, 1.0f), s);
@@ -2889,6 +3223,10 @@ void RendererImpl::Present(const uint8_t* fetch) {
   }
   // MSAA likewise: targets of another sample count are recreated as they are used.
   UpdateMsaa();
+  if (frame_ % 1200 == 0 && single_copied_ + single_reused_) {
+    REXLOG_INFO("street4 msaa single-sample copies: {} made, {} reused", single_copied_, single_reused_);
+    single_copied_ = single_reused_ = 0;
+  }
   auto present_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - present_start).count();
   static int slow_logs = 0;
@@ -2899,6 +3237,7 @@ void RendererImpl::Present(const uint8_t* fetch) {
     REXLOG_INFO("street4 frame-stats #{}: draws={} tiled_draws={} tilings={}", frame_, frame_draws_,
                 frame_tiled_draws_, frame_tilings_);
   frame_draws_ = frame_tiled_draws_ = frame_tilings_ = 0;
+  ExpireOnDemand();
   DrainWriteBacks(false);
   RenderProfile::Get().Frame();
   ++frame_;
@@ -2921,14 +3260,6 @@ static RendererImpl& Impl() {
   static RendererImpl impl;
   return impl;
 }
-
-// The D3D11 immediate context is single-threaded; CPU waits (FlushWriteBacks) can come from
-// threads other than the one issuing the draws.
-static std::recursive_mutex& ApiMutex() {
-  static std::recursive_mutex m;
-  return m;
-}
-using ApiLock = std::lock_guard<std::recursive_mutex>;
 
 Renderer& Renderer::Get() {
   static Renderer r;
