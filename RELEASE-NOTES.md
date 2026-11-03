@@ -1,5 +1,13 @@
 Work-in-progress source kit (pre-release): no game, no XEX, no generated code and no executable. Bring your own Xbox 360 disc.
 
+**v0.2.3**
+
+- **Controller vibration** on/off in the F1 PC settings.
+- The game-data installer launcher is now `Install-Files.cmd` (English name).
+- The shared game-data installer (`tools/port-installer`) ships in the repository.
+
+Vibration has been compiled but not felt on a real controller yet. Nobody has played this exact build through.
+
 **v0.2.2**
 
 - Render-to-texture results are stored only when the CPU touches them, instead of being copied every frame. At 4K, 16x anisotropic filtering, no frame limit, in a match (Ryzen 5 3600, RTX 3050 Laptop), without MSAA / 2x / 4x / 8x: 92/76/67/55 fps before, 156/116/99/73 fps now.
