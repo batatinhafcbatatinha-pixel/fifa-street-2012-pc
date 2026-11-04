@@ -21,7 +21,7 @@ An experimental port of the Xbox 360 FIFA Street (2012, sometimes called "FIFA S
 
 **Steps**
 
-**Easiest: `Setup.exe`.** Open [Releases](https://github.com/batatinhafcbatatinha-pixel/fifa-street-2012-pc/releases/latest), download **`Setup.exe`** and run it.
+**Easiest: `Setup.exe`.** Open [Releases](https://github.com/batatinhafcbatatinha-pixel/fifa-street-2012-pc/releases), download **`Setup.exe`** from the newest one and run it.
 It downloads this kit (source code only), shows what your PC already has and what is missing on its
 *Dependencies* tab, installs what is missing, asks for your `.iso` and builds the game. Afterwards the same
 program (and its desktop shortcut) is your launcher: **Play**, and **PC settings** (the same options as F1 in
@@ -33,7 +33,7 @@ the game, before it starts). Windows may say it protected your PC because the pr
 1. **Download**, one of these two ways:
    <details open><summary><b>Easiest: the ZIP</b></summary>
 
-   Open [Releases](https://github.com/batatinhafcbatatinha-pixel/fifa-street-2012-pc/releases/latest), download **`fifa-street-2012-pc-source-kit.zip`** and extract it to a short folder, such as
+   Open [Releases](https://github.com/batatinhafcbatatinha-pixel/fifa-street-2012-pc/releases), download from the newest one **`fifa-street-2012-pc-source-kit.zip`** and extract it to a short folder, such as
    `C:\Games\fifa-street-2012-pc`.
    </details>
    <details><summary><b>With Git: always the newest version</b></summary>
